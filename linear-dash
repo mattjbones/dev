@@ -1,0 +1,771 @@
+#!/usr/bin/env node
+// linear-dash — Linear project dashboard with live GitHub merge readiness.
+//
+// Usage:
+//   linear-dash [project] [--repo owner/name] [--watch [secs]]
+//
+//   project    Linear project URL, UUID, or name. Defaults to $LINEAR_DASH_PROJECT;
+//              with neither set, shows your open Linear tickets grouped by project
+//              and sorted by priority.
+//   --repo     GitHub repo to resolve PRs against (default: LupaPets/lupa).
+//   --watch    Self-refreshing loop (default 60s). Without it, renders once —
+//              pair with: watch -c -n 60 linear-dash
+//
+// Config (no secrets in this file):
+//   LINEAR_API_KEY            Linear personal API key, or put it in
+//                             ~/.config/linear/api_key (chmod 600).
+//   LINEAR_DASH_PROJECT       Default Linear project (URL, UUID, or name) when no
+//                             project argument is given.
+//   LUPA_DASH_REPO_DIR        Local checkout used to cross-check closed PRs
+//                             against origin/main (default: ~/workspace/lupa).
+//
+// Fallback: the last successful Linear fetch is cached in ~/.cache/linear-dash/
+// and used when Linear is unreachable; GitHub statuses stay live either way.
+// Merge truth: the merge process can land commits on main while leaving the PR
+// CLOSED on GitHub, so closed PRs are cross-checked against origin/main history.
+//
+// Speed: terminal PRs (merged; closed for 24h) are cached in ~/.cache/linear-dash/
+// so only open/unknown PRs hit GitHub, and the PR-numbers-on-main set is cached
+// per SHA so only commits since the last run are scanned.
+
+import { execFile } from 'node:child_process';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+
+const execFileP = promisify(execFile);
+
+const DEFAULT_REPO = 'LupaPets/lupa';
+const CACHE_DIR = join(homedir(), '.cache', 'linear-dash');
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// ---------- args ----------
+function parseArgs(argv) {
+  const args = { project: null, repo: DEFAULT_REPO, watch: null };
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--repo') {
+      args.repo = argv[++i];
+    } else if (a === '--watch') {
+      const next = Number(argv[i + 1]);
+      args.watch = Number.isFinite(next) && next > 0 ? Number(argv[++i]) : 60;
+    } else if (a === '--help' || a === '-h') {
+      console.log('Usage: linear-dash [project url|uuid|name] [--repo owner/name] [--watch [secs]]');
+      process.exit(0);
+    } else {
+      args.project = a;
+    }
+  }
+  return args;
+}
+const ARGS = parseArgs(process.argv);
+
+// ---------- ANSI ----------
+const useColor = !process.env.NO_COLOR;
+const c = (code, s) => (useColor ? `\x1b[${code}m${s}\x1b[0m` : s);
+const bold = (s) => c('1', s);
+const dim = (s) => c('2', s);
+const red = (s) => c('31', s);
+const green = (s) => c('32', s);
+const yellow = (s) => c('33', s);
+const blue = (s) => c('34', s);
+const magenta = (s) => c('35', s);
+const cyan = (s) => c('36', s);
+
+const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+const visLen = (s) => stripAnsi(s).length;
+const padEnd = (s, n) => s + ' '.repeat(Math.max(0, n - visLen(s)));
+const truncate = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
+// ---------- Linear ----------
+function linearKey() {
+  if (process.env.LINEAR_API_KEY) {
+    return process.env.LINEAR_API_KEY.trim();
+  }
+  try {
+    return readFileSync(join(homedir(), '.config', 'linear', 'api_key'), 'utf8').trim();
+  } catch {
+    return null;
+  }
+}
+
+async function gql(query, variables) {
+  const key = linearKey();
+  if (!key) {
+    throw new Error('no API key');
+  }
+  const res = await fetch('https://api.linear.app/graphql', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: key },
+    body: JSON.stringify({ query, variables }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const body = await res.json();
+  if (body.errors) {
+    throw new Error(body.errors.map((e) => e.message).join('; '));
+  }
+  return body.data;
+}
+
+// Project to show: CLI arg wins, then $LINEAR_DASH_PROJECT; null → "my open tickets" mode.
+function projectArg() {
+  return ARGS.project ?? process.env.LINEAR_DASH_PROJECT ?? null;
+}
+
+let resolvedProjectId = null;
+async function resolveProjectId(arg) {
+  if (resolvedProjectId) {
+    return resolvedProjectId;
+  }
+  if (UUID_RE.test(arg)) {
+    resolvedProjectId = arg;
+    return arg;
+  }
+  const urlMatch = arg.match(/linear\.app\/[^/]+\/project\/([^/?#]+)/);
+  const slug = (urlMatch ? urlMatch[1] : arg).toLowerCase();
+  const data = await gql('{ projects(first: 250) { nodes { id name url } } }');
+  const nodes = data.projects.nodes;
+  const hit =
+    nodes.find((p) => p.url.toLowerCase().endsWith(`/${slug}`)) ??
+    nodes.find((p) => p.name.toLowerCase() === arg.toLowerCase()) ??
+    nodes.find((p) => p.name.toLowerCase().includes(arg.toLowerCase()));
+  if (!hit) {
+    throw new Error(`no Linear project matching "${arg}"`);
+  }
+  resolvedProjectId = hit.id;
+  return hit.id;
+}
+
+function groupForState(state) {
+  if (state.type === 'completed' || state.name === 'Merged') {
+    return 'completed';
+  }
+  if (state.type === 'started') {
+    return 'inProgress';
+  }
+  if (state.type === 'cancelled' || state.type === 'canceled') {
+    return null; // hide cancelled tickets
+  }
+  return 'todo';
+}
+
+function ticketsFromIssues(issueNodes) {
+  const prUrlRe = new RegExp(`github\\.com/${ARGS.repo}/pull/(\\d+)`, 'i');
+  const tickets = [];
+  for (const issue of issueNodes) {
+    const group = groupForState(issue.state);
+    if (group === null) {
+      continue;
+    }
+    let prNumber = null;
+    for (const a of issue.attachments.nodes) {
+      const m = a.url.match(prUrlRe);
+      if (m) {
+        prNumber = Number(m[1]);
+        break;
+      }
+    }
+    tickets.push({
+      id: issue.identifier,
+      title: issue.title,
+      priority: issue.priority,
+      status: issue.state.name,
+      group,
+      branch: issue.branchName,
+      prNumber,
+      projectName: issue.project?.name,
+    });
+  }
+  return tickets;
+}
+
+async function fetchLinearProject(id) {
+  const query = `
+    query($id: String!) {
+      project(id: $id) {
+        name
+        targetDate
+        issues(first: 100) {
+          nodes {
+            identifier
+            title
+            priority
+            branchName
+            state { name type }
+            attachments(first: 20) { nodes { url } }
+          }
+        }
+      }
+    }`;
+  const project = (await gql(query, { id })).project;
+  return { id, name: project.name, targetDate: project.targetDate, tickets: ticketsFromIssues(project.issues.nodes) };
+}
+
+// Default mode (no project arg/env): my open tickets, grouped by project.
+async function fetchMyTickets() {
+  const query = `{
+    viewer {
+      assignedIssues(
+        first: 100
+        filter: { state: { type: { in: ["triage", "backlog", "unstarted", "started"] } } }
+      ) {
+        nodes {
+          identifier
+          title
+          priority
+          branchName
+          project { name }
+          state { name type }
+          attachments(first: 20) { nodes { url } }
+        }
+      }
+    }
+  }`;
+  const nodes = (await gql(query)).viewer.assignedIssues.nodes;
+  return { id: 'my-open-tickets', name: 'My open tickets', targetDate: null, mode: 'mine', tickets: ticketsFromIssues(nodes) };
+}
+
+async function fetchLinearData() {
+  const arg = projectArg();
+  return arg ? fetchLinearProject(await resolveProjectId(arg)) : fetchMyTickets();
+}
+
+// ---------- fallback cache ----------
+function cachePath(projectId) {
+  return join(CACHE_DIR, `${projectId}.json`);
+}
+
+function writeCache(data) {
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    writeFileSync(cachePath(data.id), JSON.stringify({ ...data, fetchedAt: new Date().toISOString() }));
+  } catch {
+    // cache is best-effort
+  }
+}
+
+function readCache() {
+  // Without Linear we can only read a cache for a UUID-addressed project (or "mine" mode).
+  const arg = projectArg();
+  const id = arg == null ? 'my-open-tickets' : UUID_RE.test(arg) ? arg : null;
+  if (!id) {
+    return null;
+  }
+  try {
+    return JSON.parse(readFileSync(cachePath(id), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// ---------- GitHub ----------
+const PR_JSON_FIELDS = 'number,state,isDraft,reviewDecision,mergeStateStatus,statusCheckRollup,url';
+
+// Terminal PRs never change (merged) or change rarely (closed → reopened), so
+// cache them and only hit GitHub for the delta: open and not-yet-seen PRs.
+const CLOSED_PR_TTL_MS = 24 * 60 * 60 * 1000;
+const repoSlug = () => ARGS.repo.replace('/', '--');
+
+function readJsonCache(file) {
+  try {
+    return JSON.parse(readFileSync(join(CACHE_DIR, file), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function writeJsonCache(file, data) {
+  try {
+    mkdirSync(CACHE_DIR, { recursive: true });
+    writeFileSync(join(CACHE_DIR, file), JSON.stringify(data));
+  } catch {
+    // cache is best-effort
+  }
+}
+
+const prCacheFile = () => `prs-${repoSlug()}.json`;
+
+function prCacheKey(ticket) {
+  return ticket.prNumber != null ? `#${ticket.prNumber}` : ticket.branch ? `branch:${ticket.branch}` : null;
+}
+
+const NO_PR_TTL_MS = 60 * 60 * 1000;
+
+// undefined → cache miss, go fetch; null → known "no PR"; object → usable PR.
+function cachedPr(cache, key) {
+  const hit = cache[key];
+  if (!hit) {
+    return undefined;
+  }
+  const fresh = (ttl) => Date.now() - Date.parse(hit.cachedAt) < ttl;
+  if (hit.pr === null) {
+    return fresh(NO_PR_TTL_MS) ? null : undefined;
+  }
+  if (hit.pr.state === 'MERGED') {
+    return hit.pr;
+  }
+  if (hit.pr.state === 'CLOSED' && fresh(CLOSED_PR_TTL_MS)) {
+    return hit.pr;
+  }
+  return undefined;
+}
+
+// Resolution order: in-memory match against the open-PR list (free), then the
+// terminal/no-PR cache, then a live `gh pr view` (the delta) whose terminal
+// result is cached for next time.
+async function fetchPr(ticket, cache, openPrs) {
+  const open =
+    (ticket.prNumber != null && openPrs.byNumber.get(ticket.prNumber)) ||
+    (ticket.branch && openPrs.byBranch.get(ticket.branch)) ||
+    null;
+  if (open) {
+    return open;
+  }
+  const key = prCacheKey(ticket);
+  if (!key) {
+    return null;
+  }
+  const cached = cachedPr(cache, key);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const ref = ticket.prNumber != null ? String(ticket.prNumber) : ticket.branch;
+  try {
+    const { stdout } = await execFileP('gh', ['pr', 'view', ref, '--repo', ARGS.repo, '--json', PR_JSON_FIELDS]);
+    const pr = JSON.parse(stdout);
+    if (pr.state === 'MERGED' || pr.state === 'CLOSED') {
+      cache[key] = { pr, cachedAt: new Date().toISOString() };
+    }
+    return pr;
+  } catch {
+    cache[key] = { pr: null, cachedAt: new Date().toISOString() };
+    return null;
+  }
+}
+
+// The merge process can land commits on main while leaving the PR CLOSED (not MERGED)
+// on GitHub, so cross-check closed PRs against origin/main commit subjects.
+// PR numbers already seen on main stay on main, so the set is cached per SHA and
+// only commits since the cached SHA are scanned (full 5000-commit rescan on force-push).
+async function fetchMainPrNumbers() {
+  const repoDir = process.env.LUPA_DASH_REPO_DIR || join(homedir(), 'workspace', 'lupa');
+  try {
+    await execFileP('git', ['-C', repoDir, 'fetch', 'origin', 'main', '--quiet']);
+  } catch {
+    // offline / fetch failed — fall back to whatever origin/main we have locally
+  }
+  const cacheFile = `main-prs-${repoSlug()}.json`;
+  const cached = readJsonCache(cacheFile);
+  const numbers = new Set(cached?.numbers ?? []);
+  try {
+    const { stdout: shaOut } = await execFileP('git', ['-C', repoDir, 'rev-parse', 'origin/main']);
+    const sha = shaOut.trim();
+    if (cached?.sha === sha) {
+      return numbers;
+    }
+    let range = null;
+    if (cached?.sha) {
+      try {
+        await execFileP('git', ['-C', repoDir, 'merge-base', '--is-ancestor', cached.sha, sha]);
+        range = `${cached.sha}..origin/main`;
+      } catch {
+        // cached SHA no longer an ancestor (force-push / gc) — full rescan
+      }
+    }
+    const logArgs = range ? ['log', range, '--pretty=%s'] : ['log', 'origin/main', '-n', '5000', '--pretty=%s'];
+    const { stdout } = await execFileP('git', ['-C', repoDir, ...logArgs], { maxBuffer: 64 * 1024 * 1024 });
+    for (const match of stdout.matchAll(/\(#(\d+)\)/g)) {
+      numbers.add(Number(match[1]));
+    }
+    writeJsonCache(cacheFile, { sha, numbers: [...numbers] });
+    return numbers;
+  } catch {
+    return numbers;
+  }
+}
+
+const CI_PASS = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
+const CI_FAIL = new Set(['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
+
+const CI_COUNT_FIELDS = `commits(last: 1) { nodes { commit { statusCheckRollup {
+  contexts(first: 1) {
+    checkRunCountsByState { state count }
+    statusContextCountsByState { state count }
+  }
+} } } }`;
+
+// Aggregate CI counts for many PRs in one batched GraphQL query — asking
+// `gh pr list` for statusCheckRollup pulls every individual check context
+// (~1600 nodes across ~50 PRs) and dominates the whole run time.
+async function fetchCiCounts(numbers) {
+  const counts = new Map();
+  if (numbers.length === 0) {
+    return counts;
+  }
+  const [owner, name] = ARGS.repo.split('/');
+  const aliases = numbers.map((n) => `p${n}: pullRequest(number: ${n}) { ${CI_COUNT_FIELDS} }`).join('\n');
+  const query = `query { repository(owner: "${owner}", name: "${name}") { ${aliases} } }`;
+  try {
+    const { stdout } = await execFileP('gh', ['api', 'graphql', '-f', `query=${query}`], { maxBuffer: 16 * 1024 * 1024 });
+    const repo = JSON.parse(stdout).data.repository;
+    for (const n of numbers) {
+      const contexts = repo[`p${n}`]?.commits.nodes[0]?.commit.statusCheckRollup?.contexts;
+      if (!contexts) {
+        counts.set(n, null); // no checks
+        continue;
+      }
+      const c = { pass: 0, fail: 0, pending: 0 };
+      for (const { state, count } of [...contexts.checkRunCountsByState, ...contexts.statusContextCountsByState]) {
+        c[CI_PASS.has(state) ? 'pass' : CI_FAIL.has(state) ? 'fail' : 'pending'] += count;
+      }
+      counts.set(n, c);
+    }
+  } catch {
+    // enrichment is best-effort — affected rows render as "no checks"
+  }
+  return counts;
+}
+
+// `gh pr list` is authoritative for which PRs exist (GitHub search-index lag
+// silently drops recent ones); CI counts are enriched in a second batched call.
+async function fetchMyOpenPrs() {
+  try {
+    const { stdout } = await execFileP('gh', [
+      'pr',
+      'list',
+      '--repo',
+      ARGS.repo,
+      '--author',
+      '@me',
+      '--state',
+      'open',
+      '--limit',
+      '200',
+      '--json',
+      'number,state,isDraft,reviewDecision,mergeStateStatus,url,title,headRefName',
+    ]);
+    const prs = JSON.parse(stdout);
+    const ciCounts = await fetchCiCounts(prs.map((pr) => pr.number));
+    return prs.map((pr) => ({ ...pr, ciCounts: ciCounts.get(pr.number) ?? null }));
+  } catch {
+    return [];
+  }
+}
+
+// Ticket reference from PR title (ENG-1234 / [QA-336]) or branch (matt/eng-1234-...).
+function ticketIdFromPr(pr) {
+  const fromTitle = pr.title.match(/\b([A-Z]{2,7}-\d{2,6})\b/);
+  if (fromTitle) {
+    return fromTitle[1];
+  }
+  const fromBranch = pr.headRefName.toLowerCase().match(/([a-z]{2,7})-(\d{2,6})/);
+  if (fromBranch) {
+    return `${fromBranch[1].toUpperCase()}-${fromBranch[2]}`;
+  }
+  return null;
+}
+
+// Best-effort Linear lookup (status/priority) for ticket ids outside the project.
+async function fetchLinearIssuesByIds(ids) {
+  const byId = new Map();
+  if (ids.length === 0) {
+    return byId;
+  }
+  try {
+    const teams = [...new Set(ids.map((id) => id.split('-')[0]))];
+    const numbers = [...new Set(ids.map((id) => Number(id.split('-')[1])))];
+    const query = `
+      query($teams: [String!], $numbers: [Float!]) {
+        issues(first: 250, filter: { team: { key: { in: $teams } }, number: { in: $numbers } }) {
+          nodes { identifier priority state { name type } }
+        }
+      }`;
+    const data = await gql(query, { teams, numbers });
+    for (const issue of data.issues.nodes) {
+      byId.set(issue.identifier, issue);
+    }
+  } catch {
+    // enrichment only — sections still render without Linear
+  }
+  return byId;
+}
+
+function ciCountsFromRollup(rollup) {
+  if (!rollup || rollup.length === 0) {
+    return null;
+  }
+  const counts = { pass: 0, fail: 0, pending: 0 };
+  for (const check of rollup) {
+    const s = check.conclusion || check.state || check.status || '';
+    counts[CI_PASS.has(s) ? 'pass' : CI_FAIL.has(s) ? 'fail' : 'pending']++;
+  }
+  return counts;
+}
+
+function ciSummary(pr) {
+  // ciCounts comes pre-aggregated from the GraphQL list; `gh pr view` results
+  // (and older cache entries) carry the raw statusCheckRollup instead.
+  const counts = pr.ciCounts !== undefined ? pr.ciCounts : ciCountsFromRollup(pr.statusCheckRollup);
+  if (!counts || counts.pass + counts.fail + counts.pending === 0) {
+    return { label: dim('no checks'), ok: true };
+  }
+  if (counts.fail > 0) {
+    return { label: red(`✗ CI ${counts.fail} failing`), ok: false };
+  }
+  if (counts.pending > 0) {
+    return { label: yellow(`● CI ${counts.pending} running`), ok: false };
+  }
+  return { label: green(`✓ CI ${counts.pass}`), ok: true };
+}
+
+function reviewSummary(pr) {
+  switch (pr.reviewDecision) {
+    case 'APPROVED':
+      return { label: green('✓ approved'), ok: true };
+    case 'CHANGES_REQUESTED':
+      return { label: red('✗ changes requested'), ok: false };
+    default:
+      return { label: yellow('○ needs review'), ok: false };
+  }
+}
+
+function mergeReadiness(pr, onMain) {
+  if (!pr) {
+    return { pr: dim('—'), status: dim('no PR') };
+  }
+  const num = cyan(`#${pr.number}`);
+  if (pr.state === 'MERGED' || onMain) {
+    return { pr: num, status: magenta('⬢ merged') };
+  }
+  if (pr.state === 'CLOSED') {
+    return { pr: num, status: dim('closed (unmerged)') };
+  }
+  const ci = ciSummary(pr);
+  const review = reviewSummary(pr);
+  const parts = [ci.label, review.label];
+  if (pr.isDraft) {
+    parts.unshift(dim('draft'));
+  } else if (pr.mergeStateStatus === 'DIRTY') {
+    parts.push(red('⚠ conflicts'));
+  } else if (pr.mergeStateStatus === 'BEHIND') {
+    parts.push(yellow('↓ behind base'));
+  } else if (ci.ok && review.ok) {
+    parts.push(bold(green('► READY TO MERGE')));
+  }
+  return { pr: num, status: parts.join('  ') };
+}
+
+// ---------- Grouping / sorting ----------
+function priorityBadge(ticket) {
+  switch (ticket.priority) {
+    case 1:
+      return red(bold('▲ Urgent'));
+    case 2:
+      return yellow('▲ High  ');
+    case 3:
+      return blue('■ Medium');
+    case 4:
+      return dim('▽ Low   ');
+    default:
+      return dim('· —     ');
+  }
+}
+
+const prioritySortKey = (ticket) => (ticket.priority === 0 ? 5 : ticket.priority);
+
+// Live status: GitHub PR state wins over Linear.
+function liveGroupAndStatus(ticket, pr, onMain) {
+  if (pr?.state === 'MERGED' || onMain) {
+    return { group: 'completed', status: 'Merged' };
+  }
+  if (pr?.state === 'OPEN') {
+    return { group: 'inProgress', status: pr.isDraft ? 'Draft PR' : 'PR Review' };
+  }
+  return { group: ticket.group, status: ticket.status };
+}
+
+// ---------- Render ----------
+function renderRow(ticket, status, readiness, titleWidth) {
+  const cols = [
+    padEnd(priorityBadge(ticket), 9),
+    padEnd(ticket.id ? cyan(ticket.id) : dim('—'), 9),
+    padEnd(truncate(ticket.title, titleWidth), titleWidth + 1),
+    padEnd(dim(status), 12),
+    padEnd(readiness.pr, 7),
+    readiness.status,
+  ];
+  return `    ${cols.join(' ')}`;
+}
+
+function render(project, rows, sourceLabel, extras) {
+  const width = Math.min(process.stdout.columns || Number(process.env.COLUMNS) || 130, 160);
+  const byPriority = (a, b) => prioritySortKey(a.ticket) - prioritySortKey(b.ticket) || a.ticket.id.localeCompare(b.ticket.id);
+
+  // Project mode: sections by state. "Mine" mode: sections by Linear project.
+  let sections;
+  let doneCount;
+  if (project.mode === 'mine') {
+    const colors = [yellow, blue, magenta, cyan, green];
+    const byProject = new Map();
+    for (const row of rows) {
+      const key = row.ticket.projectName ?? '(no project)';
+      if (!byProject.has(key)) {
+        byProject.set(key, []);
+      }
+      byProject.get(key).push(row);
+    }
+    const names = [...byProject.keys()].sort(
+      (a, b) => (a === '(no project)') - (b === '(no project)') || a.localeCompare(b),
+    );
+    sections = names.map((name, i) => [name.toUpperCase(), byProject.get(name), colors[i % colors.length]]);
+    doneCount = rows.filter((row) => row.group === 'completed').length;
+  } else {
+    const groups = { inProgress: [], todo: [], completed: [] };
+    for (const row of rows) {
+      groups[row.group].push(row);
+    }
+    sections = [
+      ['IN PROGRESS', groups.inProgress, yellow],
+      ['TODO', groups.todo, blue],
+      ['COMPLETED', groups.completed, green],
+    ];
+    doneCount = groups.completed.length;
+  }
+  for (const [, list] of sections) {
+    list.sort(byPriority);
+  }
+
+  const now = new Date().toLocaleTimeString('en-GB');
+  const lines = [];
+  lines.push(
+    bold(`  ${project.name}`) +
+      dim(`  ·  target ${project.targetDate ?? '—'}  ·  ${doneCount}/${rows.length} done  ·  refreshed ${now}  ·  `) +
+      sourceLabel,
+  );
+  lines.push(dim('  ' + '─'.repeat(width - 4)));
+
+  const titleWidth = Math.max(30, width - 78);
+
+  for (const [title, list, color] of sections) {
+    lines.push('');
+    lines.push(`  ${color(bold(`${title} (${list.length})`))}`);
+    if (list.length === 0) {
+      lines.push(dim('    (none)'));
+      continue;
+    }
+    for (const { ticket, status, readiness } of list) {
+      lines.push(renderRow(ticket, status, readiness, titleWidth));
+    }
+  }
+
+  const extraSections = [
+    ['MY OTHER OPEN PRS — WITH TICKET', extras.withTicket, magenta],
+    ['MY OPEN PRS — NO LINEAR TICKET', extras.noTicket, cyan],
+  ];
+  for (const [title, list, color] of extraSections) {
+    if (list.length === 0) {
+      continue;
+    }
+    lines.push('');
+    lines.push(dim('  ' + '─'.repeat(width - 4)));
+    lines.push(`  ${color(bold(`${title} (${list.length})`))}`);
+    for (const { ticket, status, readiness } of list) {
+      lines.push(renderRow(ticket, status, readiness, titleWidth));
+    }
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
+// ---------- Main ----------
+async function runOnce() {
+  // Git/GitHub work doesn't depend on Linear — start it before the Linear fetch,
+  // and enrich ticket ids from open PRs as soon as the PR list lands (superset of
+  // what's rendered; filtered below).
+  const mainPrNumbersP = fetchMainPrNumbers();
+  const myOpenPrsP = fetchMyOpenPrs();
+  const linearByIdP = myOpenPrsP.then((prs) => fetchLinearIssuesByIds([...new Set(prs.map(ticketIdFromPr).filter(Boolean))]));
+
+  let project;
+  let sourceLabel;
+  try {
+    project = await fetchLinearData();
+    writeCache(project);
+    sourceLabel = green('Linear ● live');
+  } catch (err) {
+    project = readCache();
+    if (!project) {
+      throw new Error(
+        `Linear unavailable (${err.message}) and no cached snapshot for this project.\n` +
+          'Set LINEAR_API_KEY or write your key to ~/.config/linear/api_key\n' +
+          '(create one at https://linear.app/settings/account/security).',
+      );
+    }
+    sourceLabel = yellow(`Linear ○ cached ${project.fetchedAt.slice(0, 16).replace('T', ' ')} (${err.message})`);
+  }
+  const prCache = readJsonCache(prCacheFile()) ?? {};
+  // Open PRs are already in hand from `gh pr list` — match tickets against them
+  // in memory so only unknown (likely terminal) PRs spawn a `gh pr view`.
+  const myOpenPrs = await myOpenPrsP;
+  const openPrs = {
+    byNumber: new Map(myOpenPrs.map((pr) => [pr.number, pr])),
+    byBranch: new Map(myOpenPrs.map((pr) => [pr.headRefName, pr])),
+  };
+  const [mainPrNumbers, ...prs] = await Promise.all([
+    mainPrNumbersP,
+    ...project.tickets.map((ticket) => fetchPr(ticket, prCache, openPrs)),
+  ]);
+  writeJsonCache(prCacheFile(), prCache);
+  const rows = project.tickets.map((ticket, i) => {
+    const pr = prs[i];
+    const onMain = pr != null && mainPrNumbers.has(pr.number);
+    return { ticket, pr, ...liveGroupAndStatus(ticket, pr, onMain), readiness: mergeReadiness(pr, onMain) };
+  });
+
+  // My open PRs not already shown above, split by whether they reference a ticket.
+  const shownPrNumbers = new Set(prs.filter((pr) => pr != null).map((pr) => pr.number));
+  const otherPrs = myOpenPrs.filter((pr) => !shownPrNumbers.has(pr.number));
+  const withTicketPrs = otherPrs.filter((pr) => ticketIdFromPr(pr) != null);
+  const noTicketPrs = otherPrs.filter((pr) => ticketIdFromPr(pr) == null);
+  const linearById = await linearByIdP;
+
+  const toExtraRow = (pr) => {
+    const ticketId = ticketIdFromPr(pr);
+    const linear = ticketId != null ? linearById.get(ticketId) : undefined;
+    return {
+      ticket: { id: ticketId, title: pr.title, priority: linear?.priority ?? 0 },
+      status: linear?.state.name ?? '—',
+      readiness: mergeReadiness(pr, false),
+    };
+  };
+  const byPriorityThenId = (a, b) => prioritySortKey(a.ticket) - prioritySortKey(b.ticket) || (a.ticket.id ?? '').localeCompare(b.ticket.id ?? '');
+  const extras = {
+    withTicket: withTicketPrs.map(toExtraRow).sort(byPriorityThenId),
+    noTicket: noTicketPrs.map(toExtraRow),
+  };
+  return render(project, rows, sourceLabel, extras);
+}
+
+if (ARGS.watch != null) {
+  const interval = Math.max(10, ARGS.watch) * 1000;
+  const tick = async () => {
+    try {
+      const out = await runOnce();
+      process.stdout.write(`\x1b[2J\x1b[H${out}`);
+    } catch (err) {
+      process.stdout.write(`\x1b[2J\x1b[H${red(`Error: ${err.message}`)}\n`);
+    }
+    setTimeout(tick, interval);
+  };
+  tick();
+} else {
+  runOnce()
+    .then((out) => {
+      console.log(out);
+    })
+    .catch((err) => {
+      console.error(red(`Error: ${err.message}`));
+      process.exit(1);
+    });
+}
