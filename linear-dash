@@ -2,14 +2,36 @@
 // linear-dash — Linear project dashboard with live GitHub merge readiness.
 //
 // Usage:
-//   linear-dash [project] [--repo owner/name] [--watch [secs]]
+//   linear-dash [project] [--repo owner/name] [--watch [secs]] [--all]
 //
 //   project    Linear project URL, UUID, or name. Defaults to $LINEAR_DASH_PROJECT;
 //              with neither set, shows your open Linear tickets grouped by project
 //              and sorted by priority.
 //   --repo     GitHub repo to resolve PRs against (default: LupaPets/lupa).
-//   --watch    Self-refreshing loop (default 60s). Without it, renders once —
-//              pair with: watch -c -n 60 linear-dash
+//   --watch    Self-refreshing interactive loop (default 60s). Without it, renders
+//              once (plain text, safe to pipe). The in-script --watch is what powers
+//              the TUI below — prefer it over an external `watch -c -n 60 linear-dash`,
+//              which can't do navigation, live resize, or clickable links.
+//   --all,-a   Expand the extra PR sections (in --watch, press m to toggle live).
+//
+// Interactive --watch keys (TTY only):
+//   j / k        move row by row            (↓ / ↑ also work)
+//   h / l        jump to prev / next block  (← / → also work)
+//   Ctrl-d / -u  half-page down / up
+//   g / G        first / last row
+//   /            search; type to filter, Enter to confirm, Esc to cancel/clear
+//   n / N        next / previous search match
+//   ↵ Enter      open the details page for the selected row
+//   m            show / hide the extra PR sections
+//   q / Ctrl-C   quit  ·  resizing the terminal re-renders
+//
+// Details page (↵ from the list): CI outline (failing/running + passing count),
+// unresolved review comments, then Linear comments — all lazily loaded and cached
+// for the session. j/k (Ctrl-d/u, g/G) scroll; Esc returns to the list. The header
+// links to Graphite · GitHub · Linear; CI rows link to their GitHub Actions run.
+//
+// Clickable links (OSC 8, in supporting terminals): the ticket id/title → Linear,
+// and the PR #number → Graphite. Set NO_HYPERLINKS=1 to disable.
 //
 // Config (no secrets in this file):
 //   LINEAR_API_KEY            Linear personal API key, or put it in
@@ -42,7 +64,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 // ---------- args ----------
 function parseArgs(argv) {
-  const args = { project: null, repo: DEFAULT_REPO, watch: null };
+  const args = { project: null, repo: DEFAULT_REPO, watch: null, all: false };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--repo') {
@@ -50,8 +72,16 @@ function parseArgs(argv) {
     } else if (a === '--watch') {
       const next = Number(argv[i + 1]);
       args.watch = Number.isFinite(next) && next > 0 ? Number(argv[++i]) : 60;
+    } else if (a === '--all' || a === '-a') {
+      args.all = true;
     } else if (a === '--help' || a === '-h') {
-      console.log('Usage: linear-dash [project url|uuid|name] [--repo owner/name] [--watch [secs]]');
+      console.log('Usage: linear-dash [project url|uuid|name] [--repo owner/name] [--watch [secs]] [--all]');
+      console.log('  --repo     GitHub repo for PRs (default: LupaPets/lupa)');
+      console.log('  --watch    interactive self-refreshing TUI (default 60s)');
+      console.log('  --all,-a   expand the extra PR sections (in --watch, m toggles)');
+      console.log('');
+      console.log('  --watch keys: j/k move · h/l section · Ctrl-d/u half-page · g/G ends');
+      console.log('                / search · n/N next match · ↵ details · m extras · q quit');
       process.exit(0);
     } else {
       args.project = a;
@@ -60,6 +90,10 @@ function parseArgs(argv) {
   return args;
 }
 const ARGS = parseArgs(process.argv);
+
+// Extra PR sections collapse to a one-line summary unless --all is passed; in
+// --watch mode the 'm' key toggles this live (see the watch loop below).
+let showExtras = ARGS.all;
 
 // ---------- ANSI ----------
 const useColor = !process.env.NO_COLOR;
@@ -73,10 +107,53 @@ const blue = (s) => c('34', s);
 const magenta = (s) => c('35', s);
 const cyan = (s) => c('36', s);
 
-const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, '');
+// Clickable text via OSC 8 hyperlinks (ESC]8;;URL BEL text ESC]8;; BEL). Gated on
+// a TTY: unsupported terminals or non-tty pipes (e.g. external `watch`) get plain
+// text. Supported in iTerm2, modern Terminal.app, kitty, WezTerm, VS Code, etc.
+const useLinks = !process.env.NO_HYPERLINKS && Boolean(process.stdout.isTTY);
+const link = (url, s) => (url && useLinks ? `\x1b]8;;${url}\x07${s}\x1b]8;;\x07` : s);
+
+const stripAnsi = (s) => s.replace(/\x1b\]8;;.*?\x07/g, '').replace(/\x1b\[[0-9;]*m/g, '');
 const visLen = (s) => stripAnsi(s).length;
 const padEnd = (s, n) => s + ' '.repeat(Math.max(0, n - visLen(s)));
 const truncate = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
+// Clip a string to `max` visible columns, preserving (not counting) ANSI color and
+// OSC 8 hyperlink escapes, so a too-wide line never wraps and breaks the TUI's
+// one-row-per-line math. Closes any open color/link at the cut so it can't bleed.
+function clampWidth(s, max) {
+  if (max <= 0 || visLen(s) <= max) {
+    return s;
+  }
+  let out = '';
+  let w = 0;
+  let linkOpen = false;
+  for (let i = 0; i < s.length && w < max - 1; ) {
+    if (s[i] === '\x1b') {
+      const csi = /^\x1b\[[0-9;]*m/.exec(s.slice(i));
+      if (csi) {
+        out += csi[0];
+        i += csi[0].length;
+        continue;
+      }
+      const osc = /^\x1b\]8;;.*?\x07/.exec(s.slice(i));
+      if (osc) {
+        out += osc[0];
+        i += osc[0].length;
+        linkOpen = osc[0] !== '\x1b]8;;\x07';
+        continue;
+      }
+    }
+    out += s[i];
+    i++;
+    w++;
+  }
+  out += '…';
+  if (linkOpen) {
+    out += '\x1b]8;;\x07';
+  }
+  return `${out}\x1b[0m`;
+}
 
 // ---------- Linear ----------
 function linearKey() {
@@ -168,6 +245,7 @@ function ticketsFromIssues(issueNodes) {
     }
     tickets.push({
       id: issue.identifier,
+      url: issue.url,
       title: issue.title,
       priority: issue.priority,
       status: issue.state.name,
@@ -189,6 +267,7 @@ async function fetchLinearProject(id) {
         issues(first: 100) {
           nodes {
             identifier
+            url
             title
             priority
             branchName
@@ -212,6 +291,7 @@ async function fetchMyTickets() {
       ) {
         nodes {
           identifier
+          url
           title
           priority
           branchName
@@ -478,7 +558,7 @@ async function fetchLinearIssuesByIds(ids) {
     const query = `
       query($teams: [String!], $numbers: [Float!]) {
         issues(first: 250, filter: { team: { key: { in: $teams } }, number: { in: $numbers } }) {
-          nodes { identifier priority state { name type } }
+          nodes { identifier url priority state { name type } }
         }
       }`;
     const data = await gql(query, { teams, numbers });
@@ -489,6 +569,88 @@ async function fetchLinearIssuesByIds(ids) {
     // enrichment only — sections still render without Linear
   }
   return byId;
+}
+
+// ---------- details page data (lazy, on Enter) ----------
+const graphiteUrl = (num) => `https://app.graphite.dev/github/pr/${ARGS.repo}/${num}`;
+const githubPrUrl = (num) => `https://github.com/${ARGS.repo}/pull/${num}`;
+
+// CI checks split into failing / running, with a count of the passing ones.
+async function fetchPrCi(num) {
+  const { stdout } = await execFileP('gh', ['pr', 'view', String(num), '--repo', ARGS.repo, '--json', 'statusCheckRollup'], {
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  const rollup = JSON.parse(stdout).statusCheckRollup || [];
+  const failing = [];
+  const pending = [];
+  let pass = 0;
+  for (const ch of rollup) {
+    // CheckRun → detailsUrl (Actions run); StatusContext → targetUrl (external CI).
+    const check = { name: ch.name || ch.context || 'check', url: ch.detailsUrl || ch.targetUrl || null };
+    const running = ch.status && ch.status !== 'COMPLETED';
+    const result = ch.conclusion || ch.state || '';
+    if (running) {
+      pending.push(check);
+    } else if (CI_PASS.has(result)) {
+      pass++;
+    } else if (CI_FAIL.has(result)) {
+      failing.push(check);
+    } else {
+      pending.push(check);
+    }
+  }
+  return { failing, pending, pass };
+}
+
+// Unresolved inline review threads (path/line, the commented code line, comments).
+async function fetchReviewThreads(num) {
+  const [owner, name] = ARGS.repo.split('/');
+  const query = `query($owner: String!, $name: String!) {
+    repository(owner: $owner, name: $name) {
+      pullRequest(number: ${num}) {
+        reviewDecision
+        reviewThreads(first: 100) {
+          nodes {
+            isResolved
+            path
+            line
+            originalLine
+            comments(first: 10) { nodes { author { login } body diffHunk } }
+          }
+        }
+      }
+    }
+  }`;
+  const { stdout } = await execFileP('gh', ['api', 'graphql', '-f', `owner=${owner}`, '-f', `name=${name}`, '-f', `query=${query}`], {
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  const pr = JSON.parse(stdout).data.repository.pullRequest;
+  return { decision: pr.reviewDecision, threads: pr.reviewThreads.nodes.filter((t) => !t.isResolved) };
+}
+
+// Linear comments for an issue identifier (ENG-123 → team ENG, number 123).
+async function fetchLinearComments(identifier) {
+  const [team, numStr] = identifier.split('-');
+  const number = Number(numStr);
+  const query = `query($team: String!, $number: Float!) {
+    issues(filter: { team: { key: { eq: $team } }, number: { eq: $number } }) {
+      nodes { comments(first: 50) { nodes { body createdAt user { displayName } } } }
+    }
+  }`;
+  const data = await gql(query, { team, number });
+  const issue = data.issues.nodes[0];
+  return issue ? issue.comments.nodes : [];
+}
+
+// Fetch the three sections concurrently; each settles independently so one failure
+// (or a missing PR / ticket) never blocks the others. Returns settled results.
+async function fetchDetails(meta) {
+  const [ci, review, linear] = await Promise.allSettled([
+    meta.prNumber != null ? fetchPrCi(meta.prNumber) : Promise.resolve(null),
+    meta.prNumber != null ? fetchReviewThreads(meta.prNumber) : Promise.resolve(null),
+    meta.ticketId != null ? fetchLinearComments(meta.ticketId) : Promise.resolve(null),
+  ]);
+  return { ci, review, linear };
 }
 
 function ciCountsFromRollup(rollup) {
@@ -534,7 +696,7 @@ function mergeReadiness(pr, onMain) {
   if (!pr) {
     return { pr: dim('—'), status: dim('no PR') };
   }
-  const num = cyan(`#${pr.number}`);
+  const num = link(graphiteUrl(pr.number), cyan(`#${pr.number}`));
   if (pr.state === 'MERGED' || onMain) {
     return { pr: num, status: magenta('⬢ merged') };
   }
@@ -589,8 +751,8 @@ function liveGroupAndStatus(ticket, pr, onMain) {
 function renderRow(ticket, status, readiness, titleWidth) {
   const cols = [
     padEnd(priorityBadge(ticket), 9),
-    padEnd(ticket.id ? cyan(ticket.id) : dim('—'), 9),
-    padEnd(truncate(ticket.title, titleWidth), titleWidth + 1),
+    padEnd(ticket.id ? link(ticket.url, cyan(ticket.id)) : dim('—'), 9),
+    padEnd(link(ticket.url, truncate(ticket.title, titleWidth)), titleWidth + 1),
     padEnd(dim(status), 12),
     padEnd(readiness.pr, 7),
     readiness.status,
@@ -598,7 +760,13 @@ function renderRow(ticket, status, readiness, titleWidth) {
   return `    ${cols.join(' ')}`;
 }
 
-function render(project, rows, sourceLabel, extras) {
+// Returns a structured list of line items. Each item has a `kind`:
+//   fixed   — always-visible top header (summary + rule)
+//   section — a section/group header (used as the sticky line when its rows show)
+//   row     — a selectable data row (carries `section` = its header text)
+//   blank/sep/note — decorative, non-selectable
+// flatten() joins them for one-shot/piped output; viewport() scrolls them in --watch.
+function render(project, rows, sourceLabel, extras, now) {
   const width = Math.min(process.stdout.columns || Number(process.env.COLUMNS) || 130, 160);
   const byPriority = (a, b) => prioritySortKey(a.ticket) - prioritySortKey(b.ticket) || a.ticket.id.localeCompare(b.ticket.id);
 
@@ -636,50 +804,327 @@ function render(project, rows, sourceLabel, extras) {
     list.sort(byPriority);
   }
 
-  const now = new Date().toLocaleTimeString('en-GB');
-  const lines = [];
-  lines.push(
-    bold(`  ${project.name}`) +
+  const items = [];
+  items.push({
+    kind: 'fixed',
+    text:
+      bold(`  ${project.name}`) +
       dim(`  ·  target ${project.targetDate ?? '—'}  ·  ${doneCount}/${rows.length} done  ·  refreshed ${now}  ·  `) +
       sourceLabel,
-  );
-  lines.push(dim('  ' + '─'.repeat(width - 4)));
+  });
+  items.push({ kind: 'fixed', text: dim('  ' + '─'.repeat(width - 4)) });
 
   const titleWidth = Math.max(30, width - 78);
+  const rule = () => dim('  ' + '─'.repeat(width - 4));
+  const addSection = (headerText, list, withRule) => {
+    items.push({ kind: 'blank', text: '' });
+    if (withRule) {
+      items.push({ kind: 'sep', text: rule() });
+    }
+    items.push({ kind: 'section', text: headerText });
+    if (list.length === 0) {
+      items.push({ kind: 'note', text: dim('    (none)') });
+      return;
+    }
+    for (const row of list) {
+      const { ticket, status, readiness } = row;
+      items.push({
+        kind: 'row',
+        text: renderRow(ticket, status, readiness, titleWidth),
+        section: headerText,
+        meta: {
+          ticketId: ticket.id ?? null,
+          title: ticket.title ?? '',
+          linearUrl: ticket.url ?? null,
+          prNumber: row.pr?.number ?? row.prNumber ?? null,
+        },
+      });
+    }
+  };
 
   for (const [title, list, color] of sections) {
-    lines.push('');
-    lines.push(`  ${color(bold(`${title} (${list.length})`))}`);
-    if (list.length === 0) {
-      lines.push(dim('    (none)'));
-      continue;
-    }
-    for (const { ticket, status, readiness } of list) {
-      lines.push(renderRow(ticket, status, readiness, titleWidth));
-    }
+    addSection(`  ${color(bold(`${title} (${list.length})`))}`, list, false);
   }
 
   const extraSections = [
     ['MY OTHER OPEN PRS — WITH TICKET', extras.withTicket, magenta],
     ['MY OPEN PRS — NO LINEAR TICKET', extras.noTicket, cyan],
   ];
-  for (const [title, list, color] of extraSections) {
-    if (list.length === 0) {
-      continue;
-    }
-    lines.push('');
-    lines.push(dim('  ' + '─'.repeat(width - 4)));
-    lines.push(`  ${color(bold(`${title} (${list.length})`))}`);
-    for (const { ticket, status, readiness } of list) {
-      lines.push(renderRow(ticket, status, readiness, titleWidth));
+  const nonEmptyExtras = extraSections.filter(([, list]) => list.length > 0);
+  if (nonEmptyExtras.length > 0 && !showExtras) {
+    const hidden = nonEmptyExtras.reduce((n, [, list]) => n + list.length, 0);
+    const titles = nonEmptyExtras.map(([title, list]) => `${title} (${list.length})`).join('  ·  ');
+    items.push({ kind: 'blank', text: '' });
+    items.push({ kind: 'sep', text: rule() });
+    items.push({ kind: 'note', text: dim(`  ▸ ${titles}`) });
+    items.push({ kind: 'note', text: dim(`    ${hidden} hidden · ${ARGS.watch != null ? 'press m to show' : 'run with --all to show'}`) });
+  } else {
+    for (const [title, list, color] of nonEmptyExtras) {
+      addSection(`  ${color(bold(`${title} (${list.length})`))}`, list, true);
     }
   }
-  lines.push('');
-  return lines.join('\n');
+  items.push({ kind: 'blank', text: '' });
+  return items;
+}
+
+// Row index (in selection space) at which each section begins — drives h/l jumps.
+function sectionStarts(items) {
+  const starts = [];
+  let r = -1;
+  let prev = null;
+  for (const it of items) {
+    if (it.kind === 'row') {
+      r++;
+      if (it.section !== prev) {
+        starts.push(r);
+        prev = it.section;
+      }
+    }
+  }
+  return starts;
+}
+
+// Scrolling view for --watch: fixed top header, the visible body slice (selected
+// row marked), and a footer. A sticky section header appears ONLY when the selected
+// row's own section header has scrolled above the top of the viewport — when it's
+// still visible there's nothing to pin. `nav` ({ sel, top }) persists scroll state.
+// Every emitted line is clamped to the terminal width so nothing wraps.
+function viewport(items, nav, termRows, termCols, footerHint) {
+  const fixed = items.filter((i) => i.kind === 'fixed');
+  const body = items.filter((i) => i.kind !== 'fixed');
+  const rowIdx = [];
+  body.forEach((it, i) => {
+    if (it.kind === 'row') {
+      rowIdx.push(i);
+    }
+  });
+  const nRows = rowIdx.length;
+  const mark = (it) => `  ${cyan(bold('❯'))} ${it.text.slice(4)}`;
+  const cols = termCols || 200;
+  const finish = (lines) => lines.map((l) => clampWidth(l, cols)).join('\n');
+  const out = fixed.map((f) => f.text);
+  const avail = Math.max(3, (termRows || 40) - fixed.length - 1); // - footer
+
+  if (nRows === 0) {
+    out.push(...body.slice(0, avail).map((it) => it.text));
+    out.push(dim(footerHint));
+    return finish(out);
+  }
+
+  nav.sel = Math.max(0, Math.min(nav.sel, nRows - 1));
+  const selBody = rowIdx[nav.sel];
+  const selItem = body[selBody];
+  const footer = dim(footerHint) + dim(`  [${nav.sel + 1}/${nRows}]`);
+
+  // Fits on screen: render everything, no scroll, no sticky header.
+  if (body.length <= avail) {
+    nav.top = 0;
+    for (const it of body) {
+      out.push(it === selItem ? mark(it) : it.text);
+    }
+    out.push(footer);
+    return finish(out);
+  }
+
+  // Index of the selected row's section header (the nearest 'section' item above it).
+  let headerIdx = 0;
+  for (let i = selBody; i >= 0; i--) {
+    if (body[i].kind === 'section') {
+      headerIdx = i;
+      break;
+    }
+  }
+
+  // First pass: scroll using the full height (no sticky reserved).
+  const scroll = (height) => {
+    let top = nav.top || 0;
+    if (selBody < top) {
+      top = selBody;
+    }
+    if (selBody >= top + height) {
+      top = selBody - height + 1;
+    }
+    return Math.max(0, Math.min(top, Math.max(0, body.length - height)));
+  };
+  let top = scroll(avail);
+  // Pin the header only if it's scrolled above the viewport. Showing it costs a row,
+  // so recompute the scroll window against the reduced height.
+  const sticky = headerIdx < top;
+  if (sticky) {
+    top = scroll(avail - 1);
+    out.push(selItem.section);
+  }
+  nav.top = top;
+
+  const height = sticky ? avail - 1 : avail;
+  for (const it of body.slice(top, top + height)) {
+    out.push(it === selItem ? mark(it) : it.text);
+  }
+  out.push(footer);
+  return finish(out);
+}
+
+// ---------- details page rendering ----------
+function relTime(iso) {
+  const ms = Date.now() - Date.parse(iso);
+  if (!Number.isFinite(ms)) {
+    return '';
+  }
+  const mins = Math.round(ms / 60000);
+  if (mins < 60) {
+    return `${Math.max(0, mins)}m ago`;
+  }
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) {
+    return `${hrs}h ago`;
+  }
+  return `${Math.round(hrs / 24)}d ago`;
+}
+
+// Word-wrap plain text (no ANSI) to `width`, preserving blank lines.
+function wrapText(text, width) {
+  const lines = [];
+  for (const para of String(text).replace(/\r/g, '').split('\n')) {
+    if (!para.trim()) {
+      lines.push('');
+      continue;
+    }
+    let cur = '';
+    for (const word of para.split(/\s+/)) {
+      if (cur && cur.length + 1 + word.length > width) {
+        lines.push(cur);
+        cur = word;
+      } else {
+        cur = cur ? `${cur} ${word}` : word;
+      }
+    }
+    if (cur) {
+      lines.push(cur);
+    }
+  }
+  return lines;
+}
+
+function detailsHeader(meta) {
+  const title = bold(`  ${meta.ticketId ?? '(no ticket)'}`) + (meta.prNumber != null ? `  ${cyan(`#${meta.prNumber}`)}` : '') + (meta.title ? dim(`  ${meta.title}`) : '');
+  const links = [];
+  if (meta.prNumber != null) {
+    links.push(link(graphiteUrl(meta.prNumber), 'Graphite'));
+    links.push(link(githubPrUrl(meta.prNumber), 'GitHub'));
+  }
+  if (meta.linearUrl) {
+    links.push(link(meta.linearUrl, 'Linear'));
+  }
+  return [title, dim(`  ${links.length ? links.join('  ·  ') : '—'}`), dim('  ' + '─'.repeat(60))];
+}
+
+// Build the scrollable details body from settled fetch results, wrapping comment
+// text to the terminal width so long comments stay readable rather than truncated.
+function detailsBody(meta, parts, cols) {
+  const lines = [];
+  const wrap = (text, indent) => wrapText(text, Math.max(20, cols - indent - 2)).map((l) => ' '.repeat(indent) + l);
+
+  // CI ----------------------------------------------------------------------
+  if (meta.prNumber != null) {
+    const r = parts.ci;
+    if (r.status === 'rejected') {
+      lines.push(dim('  CI  (couldn’t load)'));
+    } else {
+      const { failing, pending, pass } = r.value;
+      const bits = [];
+      if (failing.length) {
+        bits.push(red(`✗ ${failing.length}`));
+      }
+      if (pending.length) {
+        bits.push(yellow(`● ${pending.length}`));
+      }
+      bits.push(green(`${pass} ✓`));
+      lines.push(bold('  CI') + dim(`  (${bits.join(' · ')})`));
+      for (const ch of failing) {
+        lines.push(`    ${red('✗')} ${link(ch.url, ch.name)}`);
+      }
+      for (const ch of pending) {
+        lines.push(`    ${yellow('●')} ${link(ch.url, dim(`${ch.name} (running)`))}`);
+      }
+      if (!failing.length && !pending.length) {
+        lines.push(`    ${green(`✓ all ${pass} checks passing`)}`);
+      }
+    }
+    lines.push('');
+  }
+
+  // Review ------------------------------------------------------------------
+  if (meta.prNumber != null) {
+    const r = parts.review;
+    if (r.status === 'rejected') {
+      lines.push(dim('  Review  (couldn’t load)'));
+    } else {
+      const { decision, threads } = r.value;
+      const badge =
+        decision === 'APPROVED' ? green('✓ approved') : decision === 'CHANGES_REQUESTED' ? red('✗ changes requested') : decision ? yellow('○ review pending') : dim('no review');
+      lines.push(bold('  Review') + dim('  · ') + badge);
+      if (!threads.length) {
+        lines.push(dim('    no unresolved comments'));
+      }
+      for (const t of threads) {
+        lines.push(`    ${cyan(`${t.path}:${t.line ?? t.originalLine ?? '?'}`)}`);
+        const hunk = t.comments.nodes[0]?.diffHunk;
+        if (hunk) {
+          const codeLine = hunk.split('\n').filter(Boolean).pop() || '';
+          lines.push(dim(`      │ ${codeLine.replace(/^[+\- ]/, '').slice(0, Math.max(10, cols - 10))}`));
+        }
+        for (const c of t.comments.nodes) {
+          lines.push(`      ${green(c.author?.login ?? '?')}:`);
+          lines.push(...wrap(c.body, 8));
+        }
+      }
+    }
+    lines.push('');
+  }
+
+  // Linear comments ---------------------------------------------------------
+  if (meta.ticketId != null) {
+    const r = parts.linear;
+    if (r.status === 'rejected') {
+      lines.push(dim('  Linear comments  (couldn’t load)'));
+    } else if (r.value) {
+      const comments = r.value;
+      lines.push(bold('  Linear comments') + dim(`  (${comments.length})`));
+      if (!comments.length) {
+        lines.push(dim('    none'));
+      }
+      for (const c of comments) {
+        lines.push(`    ${green(c.user?.displayName ?? '?')}${dim(` · ${relTime(c.createdAt)}`)}`);
+        lines.push(...wrap(c.body, 6));
+      }
+    }
+  }
+
+  while (lines.length && lines[lines.length - 1] === '') {
+    lines.pop();
+  }
+  return lines;
+}
+
+// Fixed header + width-clamped scrollable body + footer. Returns the frame and the
+// max scroll offset so the caller can clamp its stored scroll position.
+function scrollView(header, body, scroll, termRows, termCols, footerHint) {
+  const cols = termCols || 200;
+  const clamp = (l) => clampWidth(l, cols);
+  const avail = Math.max(3, (termRows || 40) - header.length - 1); // - footer
+  const maxScroll = Math.max(0, body.length - avail);
+  const top = Math.max(0, Math.min(scroll, maxScroll));
+  const out = header.map(clamp);
+  for (const l of body.slice(top, top + avail)) {
+    out.push(clamp(l));
+  }
+  const pos = body.length > avail ? dim(`  [${top + 1}-${Math.min(top + avail, body.length)}/${body.length}]`) : '';
+  out.push(dim(footerHint) + pos);
+  return { frame: out.join('\n'), maxScroll };
 }
 
 // ---------- Main ----------
-async function runOnce() {
+async function compute() {
   // Git/GitHub work doesn't depend on Linear — start it before the Linear fetch,
   // and enrich ticket ids from open PRs as soon as the PR list lands (superset of
   // what's rendered; filtered below).
@@ -734,9 +1179,10 @@ async function runOnce() {
     const ticketId = ticketIdFromPr(pr);
     const linear = ticketId != null ? linearById.get(ticketId) : undefined;
     return {
-      ticket: { id: ticketId, title: pr.title, priority: linear?.priority ?? 0 },
+      ticket: { id: ticketId, url: linear?.url, title: pr.title, priority: linear?.priority ?? 0 },
       status: linear?.state.name ?? '—',
       readiness: mergeReadiness(pr, false),
+      prNumber: pr.number,
     };
   };
   const byPriorityThenId = (a, b) => prioritySortKey(a.ticket) - prioritySortKey(b.ticket) || (a.ticket.id ?? '').localeCompare(b.ticket.id ?? '');
@@ -744,25 +1190,335 @@ async function runOnce() {
     withTicket: withTicketPrs.map(toExtraRow).sort(byPriorityThenId),
     noTicket: noTicketPrs.map(toExtraRow),
   };
-  return render(project, rows, sourceLabel, extras);
+  const now = new Date().toLocaleTimeString('en-GB');
+  return { project, rows, sourceLabel, extras, now };
 }
+
+const buildItems = (data) => render(data.project, data.rows, data.sourceLabel, data.extras, data.now);
+const flatten = (items) => items.map((i) => i.text).join('\n');
 
 if (ARGS.watch != null) {
   const interval = Math.max(10, ARGS.watch) * 1000;
+  const onTty = Boolean(process.stdout.isTTY);
+  // Render into the alternate screen buffer (like top/less) so refreshes don't
+  // pile up in scrollback. `\x1b[2J` would erase the screen but push the old
+  // frame into history on most terminals; the alt buffer avoids that entirely
+  // and restores the original terminal contents on exit.
+  const enter = () => onTty && process.stdout.write('\x1b[?1049h\x1b[?25l'); // alt screen + hide cursor
+  const leave = () => onTty && process.stdout.write('\x1b[?25h\x1b[?1049l'); // show cursor + primary screen
+  const interactive = onTty && Boolean(process.stdin.isTTY);
+  let left = false;
+  const restore = () => {
+    if (left) {
+      return;
+    }
+    left = true;
+    try {
+      if (interactive) {
+        process.stdin.setRawMode(false);
+      }
+    } catch {
+      // best effort
+    }
+    leave();
+  };
+  process.on('exit', restore);
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, () => {
+      restore();
+      process.exit(0);
+    });
+  }
+  enter();
+
+  // Last frame's data + view state, kept so keypresses and resizes re-render
+  // instantly without refetching from Linear/GitHub.
+  let last = null;
+  let lastItems = [];
+  let view = 'list'; // 'list' | 'details'
+  const nav = { sel: 0, top: 0 };
+  const details = { key: null, meta: null, loading: false, parts: null, scroll: 0, maxScroll: 0 };
+  const detailsCache = new Map(); // key -> settled parts (cached for the session)
+  // Incremental search over the visible list. `active` = typing a query; matches
+  // persist after Enter so n/N can cycle them.
+  const search = { active: false, query: '', matches: [], origSel: 0 };
+  const listHint = '  j/k · / search · ↵ details · h/l section · m extras · q quit';
+  const detailsHint = '  j/k scroll · g/G ends · esc back · q quit';
+  const halfPage = () => Math.max(1, Math.floor(((process.stdout.rows || 40) - 4) / 2));
+  // Home, redraw with each line cleared to its end (\x1b[K) so a shorter line never
+  // leaves remnants from the previous frame, then erase any rows below (\x1b[J).
+  const writeFrame = (frame) => {
+    process.stdout.write(`\x1b[H${frame.replace(/\n/g, '\x1b[K\n')}\x1b[K\x1b[J`);
+  };
+
+  const paintScreen = () => {
+    if (view === 'details') {
+      const body = details.loading ? ['', '  Loading…'] : detailsBody(details.meta, details.parts, process.stdout.columns);
+      const r = scrollView(details.header, body, details.scroll, process.stdout.rows, process.stdout.columns, detailsHint);
+      details.maxScroll = r.maxScroll;
+      writeFrame(r.frame);
+      return;
+    }
+    if (!last) {
+      writeFrame('\n  Loading…');
+      return;
+    }
+    if (!interactive) {
+      writeFrame(flatten(buildItems(last)));
+      return;
+    }
+    lastItems = buildItems(last);
+    let hint = listHint;
+    if (search.active) {
+      const info = !search.query ? '' : search.matches.length ? `  (${search.matches.indexOf(nav.sel) + 1}/${search.matches.length})` : '  (no matches)';
+      hint = `  /${search.query}▌${info}`;
+    } else if (search.matches.length) {
+      hint = `  /${search.query} · ${search.matches.length} matches · n/N next · esc clear · ↵ details · q quit`;
+    }
+    writeFrame(viewport(lastItems, nav, process.stdout.rows, process.stdout.columns, hint));
+  };
+  const repaint = paintScreen;
+
   const tick = async () => {
     try {
-      const out = await runOnce();
-      process.stdout.write(`\x1b[2J\x1b[H${out}`);
+      last = await compute();
+      repaint();
     } catch (err) {
-      process.stdout.write(`\x1b[2J\x1b[H${red(`Error: ${err.message}`)}\n`);
+      if (view === 'list') {
+        writeFrame(red(`Error: ${err.message}`));
+      }
     }
     setTimeout(tick, interval);
   };
+
+  const openDetails = () => {
+    const rowItem = lastItems.filter((it) => it.kind === 'row')[nav.sel];
+    if (!rowItem || !rowItem.meta) {
+      return;
+    }
+    const meta = rowItem.meta;
+    const key = `${meta.ticketId ?? ''}|${meta.prNumber ?? ''}`;
+    view = 'details';
+    details.key = key;
+    details.meta = meta;
+    details.header = detailsHeader(meta);
+    details.scroll = 0;
+    if (detailsCache.has(key)) {
+      details.loading = false;
+      details.parts = detailsCache.get(key);
+      repaint();
+      return;
+    }
+    details.loading = true;
+    details.parts = null;
+    repaint(); // show Loading… immediately
+    fetchDetails(meta)
+      .then((parts) => {
+        detailsCache.set(key, parts);
+        if (view === 'details' && details.key === key) {
+          details.loading = false;
+          details.parts = parts;
+          repaint();
+        }
+      })
+      .catch((err) => {
+        if (view === 'details' && details.key === key) {
+          details.loading = false;
+          details.parts = { ci: { status: 'rejected' }, review: { status: 'rejected' }, linear: { status: 'rejected', reason: err } };
+          repaint();
+        }
+      });
+  };
+
+  const handleDetailsKey = (key) => {
+    if (key === '\x1b') {
+      view = 'list';
+      repaint();
+      return;
+    }
+    if (key === 'j' || key === '\x1b[B') {
+      details.scroll += 1;
+    } else if (key === 'k' || key === '\x1b[A') {
+      details.scroll -= 1;
+    } else if (key === '\x04') {
+      details.scroll += halfPage(); // Ctrl-D
+    } else if (key === '\x15') {
+      details.scroll -= halfPage(); // Ctrl-U
+    } else if (key === 'g') {
+      details.scroll = 0;
+    } else if (key === 'G') {
+      details.scroll = details.maxScroll;
+    } else {
+      return;
+    }
+    details.scroll = Math.max(0, Math.min(details.scroll, details.maxScroll));
+    repaint();
+  };
+
+  const jumpSection = (dir) => {
+    const starts = sectionStarts(lastItems);
+    if (starts.length === 0) {
+      return;
+    }
+    let cur = 0;
+    for (let i = 0; i < starts.length; i++) {
+      if (starts[i] <= nav.sel) {
+        cur = i;
+      }
+    }
+    nav.sel = starts[Math.max(0, Math.min(starts.length - 1, cur + dir))];
+  };
+
+  const matchTexts = () => lastItems.filter((it) => it.kind === 'row').map((it) => stripAnsi(it.text).toLowerCase());
+  const recomputeMatches = () => {
+    const q = search.query.trim().toLowerCase();
+    search.matches = q ? matchTexts().flatMap((t, i) => (t.includes(q) ? [i] : [])) : [];
+  };
+  const jumpToMatch = () => {
+    if (search.matches.length) {
+      nav.sel = search.matches.find((i) => i >= nav.sel) ?? search.matches[0];
+    }
+  };
+  const cycleMatch = (dir) => {
+    if (!search.matches.length) {
+      return;
+    }
+    let pos = search.matches.indexOf(nav.sel);
+    if (pos === -1) {
+      // selection isn't on a match (it moved) — pick the nearest match in `dir`, wrapping.
+      if (dir > 0) {
+        const f = search.matches.findIndex((i) => i > nav.sel);
+        pos = f === -1 ? 0 : f;
+      } else {
+        let f = -1;
+        search.matches.forEach((i, k) => {
+          if (i < nav.sel) {
+            f = k;
+          }
+        });
+        pos = f === -1 ? search.matches.length - 1 : f;
+      }
+    } else {
+      pos = (pos + dir + search.matches.length) % search.matches.length;
+    }
+    nav.sel = search.matches[pos];
+  };
+
+  const handleListKey = (key) => {
+    // While typing a query, keys edit the search rather than navigate.
+    if (search.active) {
+      if (key === '\x1b') {
+        search.active = false;
+        search.query = '';
+        search.matches = [];
+        nav.sel = search.origSel; // cancel restores the pre-search position
+      } else if (key === '\r' || key === '\n') {
+        search.active = false; // confirm — keep matches so n/N can cycle
+      } else if (key === '\x7f' || key === '\x08') {
+        search.query = search.query.slice(0, -1);
+        recomputeMatches();
+        jumpToMatch();
+      } else if (key.length === 1 && key >= ' ') {
+        search.query += key;
+        recomputeMatches();
+        jumpToMatch();
+      } else {
+        return;
+      }
+      repaint();
+      return;
+    }
+    if (key === '/') {
+      search.active = true;
+      search.query = '';
+      search.matches = [];
+      search.origSel = nav.sel;
+      repaint();
+      return;
+    }
+    if (key === 'n' && search.matches.length) {
+      cycleMatch(1);
+      repaint();
+      return;
+    }
+    if (key === 'N' && search.matches.length) {
+      cycleMatch(-1);
+      repaint();
+      return;
+    }
+    if (key === '\x1b' && search.matches.length) {
+      search.query = '';
+      search.matches = [];
+      repaint();
+      return;
+    }
+    if (key === 'm' || key === 'M') {
+      showExtras = !showExtras;
+      repaint();
+      return;
+    }
+    if (key === '\r' || key === '\n') {
+      openDetails();
+      return;
+    }
+    const n = lastItems.reduce((c, it) => c + (it.kind === 'row' ? 1 : 0), 0);
+    if (n === 0) {
+      return;
+    }
+    if (key === 'j' || key === '\x1b[B') {
+      nav.sel = Math.min(n - 1, nav.sel + 1);
+    } else if (key === 'k' || key === '\x1b[A') {
+      nav.sel = Math.max(0, nav.sel - 1);
+    } else if (key === 'l' || key === '\x1b[C') {
+      jumpSection(1);
+    } else if (key === 'h' || key === '\x1b[D') {
+      jumpSection(-1);
+    } else if (key === 'g') {
+      nav.sel = 0;
+    } else if (key === 'G') {
+      nav.sel = n - 1;
+    } else if (key === '\x04') {
+      nav.sel = Math.min(n - 1, nav.sel + halfPage()); // Ctrl-D
+    } else if (key === '\x15') {
+      nav.sel = Math.max(0, nav.sel - halfPage()); // Ctrl-U
+    } else {
+      return; // ignore unmapped keys (no repaint)
+    }
+    repaint();
+  };
+
+  if (interactive) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (key) => {
+      if (key === '\x03') {
+        restore();
+        process.exit(0); // Ctrl-C always quits
+      }
+      if (view === 'list' && search.active) {
+        handleListKey(key); // typing a query — 'q' etc. are literal text
+        return;
+      }
+      if (key === 'q') {
+        restore();
+        process.exit(0);
+      }
+      if (view === 'details') {
+        handleDetailsKey(key);
+      } else {
+        handleListKey(key);
+      }
+    });
+  }
+  process.stdout.on('resize', repaint);
+
+  paintScreen(); // show Loading… before the first fetch resolves
   tick();
 } else {
-  runOnce()
-    .then((out) => {
-      console.log(out);
+  compute()
+    .then((data) => {
+      console.log(flatten(buildItems(data)));
     })
     .catch((err) => {
       console.error(red(`Error: ${err.message}`));
