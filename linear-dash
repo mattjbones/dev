@@ -13,6 +13,9 @@
 //              the TUI below — prefer it over an external `watch -c -n 60 linear-dash`,
 //              which can't do navigation, live resize, or clickable links.
 //   --all,-a   Expand the extra PR sections (in --watch, press m to toggle live).
+//   --show-cancelled
+//              Include cancelled and Duplicate tickets, which are dropped from the
+//              list by default (bucketed with completed when shown).
 //
 // Interactive --watch keys (TTY only):
 //   j / k        move row by row            (↓ / ↑ also work)
@@ -27,7 +30,7 @@
 //
 // Details page (↵ from the list): CI outline (failing/running + passing count),
 // unresolved review comments, then Linear comments — all lazily loaded and cached
-// for the session. j/k (Ctrl-d/u, g/G) scroll; Esc returns to the list. The header
+// for the session. j/k (Ctrl-d/u, g/G) scroll; r refetches; Esc returns. The header
 // links to Graphite · GitHub · Linear; CI rows link to their GitHub Actions run.
 //
 // Clickable links (OSC 8, in supporting terminals): the ticket id/title → Linear,
@@ -64,7 +67,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 // ---------- args ----------
 function parseArgs(argv) {
-  const args = { project: null, repo: DEFAULT_REPO, watch: null, all: false };
+  const args = { project: null, repo: DEFAULT_REPO, watch: null, all: false, showCancelled: false };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--repo') {
@@ -74,11 +77,14 @@ function parseArgs(argv) {
       args.watch = Number.isFinite(next) && next > 0 ? Number(argv[++i]) : 60;
     } else if (a === '--all' || a === '-a') {
       args.all = true;
+    } else if (a === '--show-cancelled' || a === '--show-canceled') {
+      args.showCancelled = true;
     } else if (a === '--help' || a === '-h') {
       console.log('Usage: linear-dash [project url|uuid|name] [--repo owner/name] [--watch [secs]] [--all]');
-      console.log('  --repo     GitHub repo for PRs (default: LupaPets/lupa)');
-      console.log('  --watch    interactive self-refreshing TUI (default 60s)');
-      console.log('  --all,-a   expand the extra PR sections (in --watch, m toggles)');
+      console.log('  --repo            GitHub repo for PRs (default: LupaPets/lupa)');
+      console.log('  --watch           interactive self-refreshing TUI (default 60s)');
+      console.log('  --all,-a          expand the extra PR sections (in --watch, m toggles)');
+      console.log('  --show-cancelled  include cancelled/duplicate tickets (hidden by default)');
       console.log('');
       console.log('  --watch keys: j/k move · h/l section · Ctrl-d/u half-page · g/G ends');
       console.log('                / search · n/N next match · ↵ details · m extras · q quit');
@@ -221,8 +227,12 @@ function groupForState(state) {
   if (state.type === 'started') {
     return 'inProgress';
   }
-  if (state.type === 'cancelled' || state.type === 'canceled') {
-    return null; // hide cancelled tickets
+  // Cancelled and Duplicate are terminal noise — drop them from the list entirely.
+  // (Linear's "Duplicate" state isn't always typed 'canceled', so match it by name
+  // too.) --show-cancelled brings them back, bucketed with completed.
+  const terminal = ['cancelled', 'canceled', 'duplicate'].includes(state.type) || state.name.trim().toLowerCase() === 'duplicate';
+  if (terminal) {
+    return ARGS.showCancelled ? 'completed' : null;
   }
   return 'todo';
 }
@@ -340,7 +350,7 @@ function readCache() {
 }
 
 // ---------- GitHub ----------
-const PR_JSON_FIELDS = 'number,state,isDraft,reviewDecision,mergeStateStatus,statusCheckRollup,url';
+const PR_JSON_FIELDS = 'number,state,isDraft,reviewDecision,mergeStateStatus,statusCheckRollup,url,headRefName,baseRefName';
 
 // Terminal PRs never change (merged) or change rarely (closed → reopened), so
 // cache them and only hit GitHub for the delta: open and not-yet-seen PRs.
@@ -523,7 +533,7 @@ async function fetchMyOpenPrs() {
       '--limit',
       '200',
       '--json',
-      'number,state,isDraft,reviewDecision,mergeStateStatus,url,title,headRefName',
+      'number,state,isDraft,reviewDecision,mergeStateStatus,url,title,headRefName,baseRefName',
     ]);
     const prs = JSON.parse(stdout);
     const ciCounts = await fetchCiCounts(prs.map((pr) => pr.number));
@@ -531,6 +541,60 @@ async function fetchMyOpenPrs() {
   } catch {
     return [];
   }
+}
+
+// Graphite stacks are PR chains by base branch: a stacked PR's baseRefName is the
+// parent PR's headRefName (rather than trunk). Walk those links among the open PRs
+// to find, per PR, how many open PRs sit below/above it and the nearest unmerged
+// one below (the blocker). Trunk needs no special-casing — the chain just ends when
+// a base branch isn't another open PR's head.
+function buildStacks(prs) {
+  const byHead = new Map();
+  const childrenOf = new Map();
+  for (const p of prs) {
+    if (p.headRefName) {
+      byHead.set(p.headRefName, p);
+    }
+    if (!childrenOf.has(p.baseRefName)) {
+      childrenOf.set(p.baseRefName, []);
+    }
+    childrenOf.get(p.baseRefName).push(p);
+  }
+  const info = new Map();
+  for (const p of prs) {
+    let below = 0;
+    let blocker = null;
+    let cur = p;
+    const seenDown = new Set([p.headRefName]);
+    for (let guard = 0; guard < 100; guard++) {
+      const parent = byHead.get(cur.baseRefName);
+      if (!parent || seenDown.has(parent.headRefName)) {
+        break;
+      }
+      seenDown.add(parent.headRefName);
+      below++;
+      if (!blocker && parent.state !== 'MERGED') {
+        blocker = { number: parent.number, title: parent.title };
+      }
+      cur = parent;
+    }
+    let above = 0;
+    const queue = [...(childrenOf.get(p.headRefName) || [])];
+    const seenUp = new Set();
+    for (let guard = 0; queue.length && guard < 500; guard++) {
+      const c = queue.pop();
+      if (seenUp.has(c.headRefName)) {
+        continue;
+      }
+      seenUp.add(c.headRefName);
+      above++;
+      queue.push(...(childrenOf.get(c.headRefName) || []));
+    }
+    if (below || above) {
+      info.set(p.number, { below, above, blocker });
+    }
+  }
+  return info;
 }
 
 // Ticket reference from PR title (ENG-1234 / [QA-336]) or branch (matt/eng-1234-...).
@@ -748,14 +812,16 @@ function liveGroupAndStatus(ticket, pr, onMain) {
 }
 
 // ---------- Render ----------
-function renderRow(ticket, status, readiness, titleWidth) {
+function renderRow(ticket, status, readiness, titleWidth, stack) {
+  // ↓N = this PR is stacked on N open PRs below it (Graphite stack depth).
+  const stackMark = stack?.below ? `${cyan(`↓${stack.below}`)} ` : '';
   const cols = [
     padEnd(priorityBadge(ticket), 9),
     padEnd(ticket.id ? link(ticket.url, cyan(ticket.id)) : dim('—'), 9),
     padEnd(link(ticket.url, truncate(ticket.title, titleWidth)), titleWidth + 1),
     padEnd(dim(status), 12),
     padEnd(readiness.pr, 7),
-    readiness.status,
+    stackMark + readiness.status,
   ];
   return `    ${cols.join(' ')}`;
 }
@@ -830,13 +896,14 @@ function render(project, rows, sourceLabel, extras, now) {
       const { ticket, status, readiness } = row;
       items.push({
         kind: 'row',
-        text: renderRow(ticket, status, readiness, titleWidth),
+        text: renderRow(ticket, status, readiness, titleWidth, row.stack),
         section: headerText,
         meta: {
           ticketId: ticket.id ?? null,
           title: ticket.title ?? '',
           linearUrl: ticket.url ?? null,
           prNumber: row.pr?.number ?? row.prNumber ?? null,
+          stack: row.stack ?? null,
         },
       });
     }
@@ -1024,6 +1091,23 @@ function detailsBody(meta, parts, cols) {
   const lines = [];
   const wrap = (text, indent) => wrapText(text, Math.max(20, cols - indent - 2)).map((l) => ' '.repeat(indent) + l);
 
+  // Stack -------------------------------------------------------------------
+  if (meta.stack && (meta.stack.below || meta.stack.above)) {
+    const s = meta.stack;
+    const bits = [];
+    if (s.below) {
+      bits.push(cyan(`↓${s.below} below`));
+    }
+    if (s.above) {
+      bits.push(cyan(`↑${s.above} above`));
+    }
+    let line = `  ${bold('Stack')}  ${bits.join(' · ')}`;
+    if (s.blocker) {
+      line += dim('  · blocked by ') + link(graphiteUrl(s.blocker.number), cyan(`#${s.blocker.number}`)) + dim(` ${truncate(s.blocker.title, 50)}`);
+    }
+    lines.push(line, '');
+  }
+
   // CI ----------------------------------------------------------------------
   if (meta.prNumber != null) {
     const r = parts.ci;
@@ -1153,6 +1237,7 @@ async function compute() {
   // Open PRs are already in hand from `gh pr list` — match tickets against them
   // in memory so only unknown (likely terminal) PRs spawn a `gh pr view`.
   const myOpenPrs = await myOpenPrsP;
+  const stacks = buildStacks(myOpenPrs); // prNumber -> { below, above, blocker }
   const openPrs = {
     byNumber: new Map(myOpenPrs.map((pr) => [pr.number, pr])),
     byBranch: new Map(myOpenPrs.map((pr) => [pr.headRefName, pr])),
@@ -1165,7 +1250,7 @@ async function compute() {
   const rows = project.tickets.map((ticket, i) => {
     const pr = prs[i];
     const onMain = pr != null && mainPrNumbers.has(pr.number);
-    return { ticket, pr, ...liveGroupAndStatus(ticket, pr, onMain), readiness: mergeReadiness(pr, onMain) };
+    return { ticket, pr, stack: pr ? stacks.get(pr.number) : undefined, ...liveGroupAndStatus(ticket, pr, onMain), readiness: mergeReadiness(pr, onMain) };
   });
 
   // My open PRs not already shown above, split by whether they reference a ticket.
@@ -1183,6 +1268,7 @@ async function compute() {
       status: linear?.state.name ?? '—',
       readiness: mergeReadiness(pr, false),
       prNumber: pr.number,
+      stack: stacks.get(pr.number),
     };
   };
   const byPriorityThenId = (a, b) => prioritySortKey(a.ticket) - prioritySortKey(b.ticket) || (a.ticket.id ?? '').localeCompare(b.ticket.id ?? '');
@@ -1243,7 +1329,7 @@ if (ARGS.watch != null) {
   // persist after Enter so n/N can cycle them.
   const search = { active: false, query: '', matches: [], origSel: 0 };
   const listHint = '  j/k · / search · ↵ details · h/l section · m extras · q quit';
-  const detailsHint = '  j/k scroll · g/G ends · esc back · q quit';
+  const detailsHint = '  j/k scroll · g/G ends · r refresh · esc back · q quit';
   const halfPage = () => Math.max(1, Math.floor(((process.stdout.rows || 40) - 4) / 2));
   // Home, redraw with each line cleared to its end (\x1b[K) so a shorter line never
   // leaves remnants from the previous frame, then erase any rows below (\x1b[J).
@@ -1291,27 +1377,12 @@ if (ARGS.watch != null) {
     setTimeout(tick, interval);
   };
 
-  const openDetails = () => {
-    const rowItem = lastItems.filter((it) => it.kind === 'row')[nav.sel];
-    if (!rowItem || !rowItem.meta) {
-      return;
-    }
-    const meta = rowItem.meta;
-    const key = `${meta.ticketId ?? ''}|${meta.prNumber ?? ''}`;
-    view = 'details';
-    details.key = key;
-    details.meta = meta;
-    details.header = detailsHeader(meta);
-    details.scroll = 0;
-    if (detailsCache.has(key)) {
-      details.loading = false;
-      details.parts = detailsCache.get(key);
-      repaint();
-      return;
-    }
+  // Fetch (or refetch) the current item's details, showing Loading… until it lands.
+  // Late results for a details page the user has since left/changed are ignored.
+  const loadDetails = (meta, key) => {
     details.loading = true;
     details.parts = null;
-    repaint(); // show Loading… immediately
+    repaint();
     fetchDetails(meta)
       .then((parts) => {
         detailsCache.set(key, parts);
@@ -1330,10 +1401,36 @@ if (ARGS.watch != null) {
       });
   };
 
+  const openDetails = () => {
+    const rowItem = lastItems.filter((it) => it.kind === 'row')[nav.sel];
+    if (!rowItem || !rowItem.meta) {
+      return;
+    }
+    const meta = rowItem.meta;
+    const key = `${meta.ticketId ?? ''}|${meta.prNumber ?? ''}`;
+    view = 'details';
+    details.key = key;
+    details.meta = meta;
+    details.header = detailsHeader(meta);
+    details.scroll = 0;
+    if (detailsCache.has(key)) {
+      details.loading = false;
+      details.parts = detailsCache.get(key);
+      repaint();
+      return;
+    }
+    loadDetails(meta, key);
+  };
+
   const handleDetailsKey = (key) => {
     if (key === '\x1b') {
       view = 'list';
       repaint();
+      return;
+    }
+    if (key === 'r') {
+      detailsCache.delete(details.key); // force a fresh fetch, bypassing the cache
+      loadDetails(details.meta, details.key);
       return;
     }
     if (key === 'j' || key === '\x1b[B') {
