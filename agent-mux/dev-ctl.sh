@@ -33,7 +33,7 @@ unset _dctl_source _dctl_dir _dctl_link
 CONFIG_DIR="$HOME/.config/dev-ctl"
 QUICK_ACTIONS="$CONFIG_DIR/quick-actions.txt"
 DEV_TMUX="$SCRIPT_DIR/dev.sh"
-LUPA_REPO="/Users/mbarnettjones/workspace/lupa"
+LUPA_REPO="$HOME/workspace/lupa"
 GITHUB_REPO="${DEV_CTL_GITHUB_REPO:-LupaPets/lupa}"
 CLEANUP_STATE_DIR="/tmp/dev-ctl-cleanup"
 
@@ -136,7 +136,7 @@ session_info() {
   local compose_project
   # Mirror docker-start.sh's compose project normalisation (lowercase, non [a-z0-9_-] -> '-')
   compose_project="$(printf '%s' "$session" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/--*/-/g')"
-  local worktree="/Users/mbarnettjones/workspace/$session"
+  local worktree="$HOME/workspace/$session"
   if docker ps --filter "label=com.docker.compose.project=$compose_project" --filter "status=running" -q 2>/dev/null | grep -q .; then
     docker_icon="🐳"
   # Compose files live in docker/ since #11882, so the working_dir label is <worktree>/docker
@@ -331,7 +331,7 @@ worktree_path_for_session() {
     printf '%s\n' "$p"
     return 0
   fi
-  local w="/Users/mbarnettjones/workspace/$s"
+  local w="$HOME/workspace/$s"
   if [ -d "$w" ]; then
     printf '%s\n' "$w"
     return 0
@@ -413,7 +413,7 @@ list_orphaned_sessions() {
       continue
     fi
     # Also check if ~/workspace/<session> exists as a directory (might not be a git worktree)
-    if [ -d "/Users/mbarnettjones/workspace/$session" ]; then
+    if [ -d "$HOME/workspace/$session" ]; then
       continue
     fi
     # Check if it's the main lupa session
@@ -527,7 +527,7 @@ resolve_workspace_worktree() {
     printf '%s\n' "$wt"
     return 0
   fi
-  local wt_path="/Users/mbarnettjones/workspace/$name"
+  local wt_path="$HOME/workspace/$name"
   if [ -d "$wt_path" ] && [ "$wt_path" != "$LUPA_REPO" ]; then
     printf '%s\n' "$wt_path"
     return 0
@@ -616,7 +616,7 @@ action_stop() {
   if [ -z "$worktree" ]; then
     worktree="$(tmux display-message -t "$session:.0" -p '#{pane_current_path}' 2>/dev/null || true)"
     # Pane cwd may be a subdir — walk up to a tree that has docker/docker-compose.dev.yml
-    local d="${worktree:-/Users/mbarnettjones/workspace/$session}"
+    local d="${worktree:-$HOME/workspace/$session}"
     while [ -n "$d" ] && [ "$d" != "/" ]; do
       if [ -f "$d/docker/docker-compose.dev.yml" ]; then
         worktree="$d"
@@ -1010,7 +1010,7 @@ preview_pane() {
     tmux capture-pane -t "$session:.0" -p -S -40 2>/dev/null || echo "(no pane content)"
   else
     # Inactive worktree — show git log
-    local worktree="/Users/mbarnettjones/workspace/$session"
+    local worktree="$HOME/workspace/$session"
     if [ ! -d "$worktree" ]; then
       # Check claude agent worktrees
       worktree="$LUPA_REPO/.claude/worktrees/$session"

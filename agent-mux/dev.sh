@@ -20,7 +20,12 @@ while [ -h "$_dev_source" ]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$_dev_source")" && pwd)"
 unset _dev_source _dev_dir _dev_link
-LUPA_REPO="/Users/mbarnettjones/workspace/lupa"
+LUPA_REPO="$HOME/workspace/lupa"
+
+# Set by ensure_monorepo_deps when it starts a background pnpm install, so the
+# build pane can wait for it before launching the dev server. Empty = no wait.
+PNPM_INSTALL_DONE_FILE=""
+PNPM_INSTALL_LOG_FILE=""
 
 # Worktrees get their own monorepo/node_modules. pnpm's content-addressable
 # store keeps packages shared across worktrees without sharing the node_modules
@@ -72,9 +77,16 @@ ensure_monorepo_deps() {
 
   log_slug="$(printf '%s' "$(basename "$wt")" | tr -c '[:alnum:]_.-' '-')"
   log_file="/tmp/dev-pnpm-install-${log_slug}.log"
+  local done_file="/tmp/dev-pnpm-install-${log_slug}.done"
+  rm -f "$done_file"
 
   echo "Installing monorepo deps for this worktree with pnpm (log: $log_file)..."
-  (cd "$monorepo" && run_pnpm_install >"$log_file" 2>&1) &
+  # Record the install's exit code on completion so the build pane can wait for
+  # node_modules before starting nx/vite (see dev-wait-pnpm.sh).
+  (cd "$monorepo" && run_pnpm_install >"$log_file" 2>&1; echo "$?" >"$done_file") &
+
+  PNPM_INSTALL_DONE_FILE="$done_file"
+  PNPM_INSTALL_LOG_FILE="$log_file"
 }
 
 usage() {
@@ -196,7 +208,7 @@ fi
 BRANCH="${1:-}"
 
 if [ -n "$BRANCH" ]; then
-  WORKTREE="/Users/mbarnettjones/workspace/$BRANCH"
+  WORKTREE="$HOME/workspace/$BRANCH"
   CLAUDE_WORKTREE="$LUPA_REPO/.claude/worktrees/$BRANCH"
   EXISTING_WORKTREE="$(
     git -C "$LUPA_REPO" worktree list --porcelain 2>/dev/null | awk -v branch="refs/heads/$BRANCH" '
@@ -262,6 +274,7 @@ tmux set-option -g pane-border-lines heavy
 tmux set-option -g pane-border-style "fg=#444444"
 tmux set-option -g pane-active-border-style "fg=green"
 AGENT_LAUNCH_SCRIPT="$SCRIPT_DIR/dev-tmux-agent-launch.sh"
+WAIT_PNPM_SCRIPT="$SCRIPT_DIR/dev-wait-pnpm.sh"
 
 # Build agent launch command based on model
 case "$MODEL" in
@@ -288,7 +301,14 @@ send_keys_when_ready "$SESSION:.0" "$AGENT_CMD"
 tmux split-window -h -p 33 -t "$SESSION" -c "$WORKTREE"
 tmux select-pane -T "📦 build"
 if [ "$USE_DOCKER" = true ]; then
-  send_keys_when_ready "$SESSION:.1" "./docker/docker-start.sh $WORKSPACE_NAME"
+  BUILD_CMD="./docker/docker-start.sh $WORKSPACE_NAME"
+  # If a background pnpm install is in flight, wait for it to finish before the
+  # dev server starts — otherwise nx/vite races node_modules and dies with
+  # "Could not find Nx modules".
+  if [ -n "$PNPM_INSTALL_DONE_FILE" ]; then
+    BUILD_CMD="\"$WAIT_PNPM_SCRIPT\" \"$PNPM_INSTALL_DONE_FILE\" \"$PNPM_INSTALL_LOG_FILE\" && $BUILD_CMD"
+  fi
+  send_keys_when_ready "$SESSION:.1" "$BUILD_CMD"
 fi
 
 # Split the right pane vertically: naked terminal

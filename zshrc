@@ -165,7 +165,7 @@ function ldev() {
 
 
 # pnpm
-export PNPM_HOME="/Users/mbarnettjones/Library/pnpm"
+export PNPM_HOME="$HOME/Library/pnpm"
 case ":$PATH:" in
   *":$PNPM_HOME:"*) ;;
   *) export PATH="$PNPM_HOME:$PATH" ;;
@@ -181,7 +181,7 @@ esac
 [ -f "$HOME/.zshrc.secrets" ] && source "$HOME/.zshrc.secrets"
 
 # bun completions
-[ -s "/Users/mbarnettjones/.bun/_bun" ] && source "/Users/mbarnettjones/.bun/_bun"
+[ -s "$HOME/.bun/_bun" ] && source "$HOME/.bun/_bun"
 
 # bun
 export BUN_INSTALL="$HOME/.bun"
@@ -191,4 +191,17 @@ source <(fzf --zsh)
 alias cat=bat
 
 export AWS_REGION=eu-west-2
- export LINEAR_DASH_PROJECT=6d12683f-9ff0-4318-8612-9175e03fa0ce
+export LINEAR_DASH_PROJECT=6d12683f-9ff0-4318-8612-9175e03fa0ce
+
+# Default Brewfile for `brew bundle` (lives in this repo)
+export HOMEBREW_BUNDLE_FILE="$HOME/workspace/dev/Brewfile"
+
+# Ensure gpg knows the controlling terminal
+export GPG_TTY=$(tty)
+
+# Ensure gpg-agent uses pinentry-mac (GUI prompt + Keychain), not pinentry-curses,
+# which fails with "Inappropriate ioctl for device" when git runs without a TTY.
+if ! grep -q pinentry-mac ~/.gnupg/gpg-agent.conf 2>/dev/null; then
+  echo "pinentry-program $(brew --prefix)/bin/pinentry-mac" >> ~/.gnupg/gpg-agent.conf
+  gpgconf --kill gpg-agent
+fi

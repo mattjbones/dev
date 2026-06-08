@@ -21,7 +21,7 @@ DIM='\033[2m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
-LUPA_REPO="/Users/mbarnettjones/workspace/lupa"
+LUPA_REPO="$HOME/workspace/lupa"
 
 step() {
   echo ""
