@@ -756,13 +756,16 @@ function reviewSummary(pr) {
   }
 }
 
-function mergeReadiness(pr, onMain) {
+function mergeReadiness(pr, onMain, prNumber = pr?.number) {
+  const num = prNumber != null ? link(graphiteUrl(prNumber), cyan(`#${prNumber}`)) : dim('—');
+  // `onMain` (PR landed on origin/main) is the authoritative "merged" signal for
+  // Graphite-closed PRs, and it holds even when the live `gh pr view` failed and
+  // left us without a PR object — so honour it before bailing on a missing pr.
+  if (pr?.state === 'MERGED' || onMain) {
+    return { pr: num, status: magenta('⬢ merged') };
+  }
   if (!pr) {
     return { pr: dim('—'), status: dim('no PR') };
-  }
-  const num = link(graphiteUrl(pr.number), cyan(`#${pr.number}`));
-  if (pr.state === 'MERGED' || onMain) {
-    return { pr: num, status: magenta('⬢ merged') };
   }
   if (pr.state === 'CLOSED') {
     return { pr: num, status: dim('closed (unmerged)') };
@@ -1249,8 +1252,12 @@ async function compute() {
   writeJsonCache(prCacheFile(), prCache);
   const rows = project.tickets.map((ticket, i) => {
     const pr = prs[i];
-    const onMain = pr != null && mainPrNumbers.has(pr.number);
-    return { ticket, pr, stack: pr ? stacks.get(pr.number) : undefined, ...liveGroupAndStatus(ticket, pr, onMain), readiness: mergeReadiness(pr, onMain) };
+    // Prefer the resolved PR's number, but fall back to the PR number Linear has
+    // attached to the ticket: a transient `gh pr view` failure can null out `pr`,
+    // and we don't want that to "uncomplete" a ticket whose PR is already on main.
+    const prNum = pr?.number ?? ticket.prNumber;
+    const onMain = prNum != null && mainPrNumbers.has(prNum);
+    return { ticket, pr, stack: pr ? stacks.get(pr.number) : undefined, ...liveGroupAndStatus(ticket, pr, onMain), readiness: mergeReadiness(pr, onMain, prNum) };
   });
 
   // My open PRs not already shown above, split by whether they reference a ticket.
