@@ -674,6 +674,8 @@ action_cleanup() {
   if [ -n "$worktree" ]; then
     echo "  Removing worktree at $worktree..."
     write_cleanup_status "$name" "Removing worktree" "$cleanup_started_at"
+    # Agent worktrees are locked; unlock first or `worktree remove` refuses.
+    git -C "$LUPA_REPO" worktree unlock "$worktree" 2>/dev/null || true
     git -C "$LUPA_REPO" worktree remove "$worktree" --force 2>/dev/null || true
     # If worktree remove failed (dirty, locked, etc), force-remove the directory
     if [ -d "$worktree" ]; then
@@ -732,6 +734,7 @@ action_cleanup() {
 # Prune local branches that are no longer needed.
 # Checks: remote gone, merged into main, PR merged/closed, or no PR and no worktree.
 action_prune_branches() {
+  local dry_run="${1:-false}"
   printf "${DIM}Fetching and pruning remote refs...${NC}\n"
   git -C "$LUPA_REPO" fetch --prune --quiet origin 2>/dev/null || true
 
@@ -739,9 +742,10 @@ action_prune_branches() {
   local worktree_branches
   worktree_branches="$(git -C "$LUPA_REPO" worktree list --porcelain 2>/dev/null | grep '^branch ' | sed 's|^branch refs/heads/||')"
 
-  # Get ALL local branches (not just gone ones)
+  # Get ALL local branches (not just gone ones). Strip the leading marker:
+  # `* ` (current), `+ ` (checked out in another worktree), or two spaces.
   local all_branches
-  all_branches="$(git -C "$LUPA_REPO" branch --list | sed 's/^[* ] //')"
+  all_branches="$(git -C "$LUPA_REPO" branch --list | sed 's/^[*+ ] //')"
 
   if [ -z "$all_branches" ]; then
     printf "${DIM}No branches found.${NC}\n"
@@ -761,44 +765,58 @@ action_prune_branches() {
       continue
     fi
 
-    # Try safe delete first (catches branches fully merged into main)
-    if git -C "$LUPA_REPO" branch -d "$branch" 2>/dev/null; then
+    # Decide whether (and why) to prune, WITHOUT mutating in dry mode. Real mode
+    # uses `branch -d` (safe merged-delete); dry mode mirrors it with a
+    # non-destructive `branch --merged main` membership check.
+    local reason=""
+    if [ "$dry_run" = true ]; then
+      if git -C "$LUPA_REPO" branch --merged main 2>/dev/null | sed 's/^[*+ ] //' | grep -qx "$branch"; then
+        reason="merged"
+      fi
+    elif git -C "$LUPA_REPO" branch -d "$branch" 2>/dev/null; then
       printf "  ${RED}✕${NC} Deleted ${BOLD}$branch${NC} ${DIM}(merged)${NC}\n"
       count=$((count + 1))
       continue
     fi
 
-    # Check if remote tracking branch is gone
-    local tracking
-    tracking="$(git -C "$LUPA_REPO" for-each-ref --format='%(upstream:track)' "refs/heads/$branch" 2>/dev/null)"
+    if [ -z "$reason" ]; then
+      # Check remote tracking branch + PR status on GitHub
+      local tracking pr_state
+      tracking="$(git -C "$LUPA_REPO" for-each-ref --format='%(upstream:track)' "refs/heads/$branch" 2>/dev/null)"
+      pr_state="$(gh pr list --repo "$GITHUB_REPO" --head "$branch" --state all --json state --jq '.[0].state' 2>/dev/null || echo "")"
+      if [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ]; then
+        reason="PR $pr_state"
+      elif [ "$tracking" = "[gone]" ]; then
+        reason="remote gone"
+      fi
+    fi
 
-    # Check PR status on GitHub
-    local pr_state
-    pr_state="$(gh pr list --repo "$GITHUB_REPO" --head "$branch" --state all --json state --jq '.[0].state' 2>/dev/null || echo "")"
-
-    if [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ]; then
-      git -C "$LUPA_REPO" branch -D "$branch" 2>/dev/null || true
-      printf "  ${RED}✕${NC} Deleted ${BOLD}$branch${NC} ${DIM}(PR $pr_state)${NC}\n"
-      count=$((count + 1))
-    elif [ "$tracking" = "[gone]" ]; then
-      # Remote gone, no PR — likely abandoned
-      git -C "$LUPA_REPO" branch -D "$branch" 2>/dev/null || true
-      printf "  ${RED}✕${NC} Deleted ${BOLD}$branch${NC} ${DIM}(remote gone)${NC}\n"
+    if [ -n "$reason" ]; then
+      if [ "$dry_run" = true ]; then
+        printf "  ${YELLOW}○${NC} Would delete ${BOLD}$branch${NC} ${DIM}($reason)${NC}\n"
+      else
+        git -C "$LUPA_REPO" branch -D "$branch" 2>/dev/null || true
+        printf "  ${RED}✕${NC} Deleted ${BOLD}$branch${NC} ${DIM}($reason)${NC}\n"
+      fi
       count=$((count + 1))
     else
       skipped=$((skipped + 1))
     fi
   done <<< "$all_branches"
 
-  # Also untrack from Graphite any branches we just deleted
-  if command -v gt &>/dev/null; then
+  # Untrack from Graphite any branches we just deleted (skip in dry mode).
+  if [ "$dry_run" = false ] && command -v gt &>/dev/null; then
     echo ""
     printf "${DIM}Syncing Graphite...${NC}\n"
     gt repo sync --force 2>/dev/null || true
   fi
 
   echo ""
-  printf "${GREEN}Pruned $count branches${NC} ${DIM}($skipped skipped)${NC}\n"
+  if [ "$dry_run" = true ]; then
+    printf "${YELLOW}Would prune $count branches${NC} ${DIM}($skipped skipped)${NC}\n"
+  else
+    printf "${GREEN}Pruned $count branches${NC} ${DIM}($skipped skipped)${NC}\n"
+  fi
 }
 
 # Rebase all active worktrees onto latest origin/main and push clean branches.
@@ -883,11 +901,12 @@ action_auto_cleanup() {
   local removed=0
   local kept=0
 
-  while IFS= read -r line; do
-    local wt_path branch
-    wt_path="$(echo "$line" | awk '{print $1}')"
-    branch="$(echo "$line" | sed -n 's/.*\[\(.*\)\]/\1/p')"
-
+  # Parse from `worktree list --porcelain`, not the human format: regexing the
+  # latter swept the trailing "locked" annotation into the branch name, and an
+  # empty/garbled branch makes `gh pr list --head` ignore the filter and return
+  # an unrelated newest PR — so every broken row got misattributed to one PR.
+  # The awk below emits one TSV row per worktree: path, branch, locked(0/1), lock-pid.
+  while IFS=$'\t' read -r wt_path branch locked lock_pid; do
     # Skip main repo
     if [ "$wt_path" = "$LUPA_REPO" ]; then
       continue
@@ -896,7 +915,7 @@ action_auto_cleanup() {
     local wt_name
     wt_name="$(basename "$wt_path")"
 
-    # Skip worktrees with uncommitted changes
+    # Always protect uncommitted changes
     if [ -n "$(git -C "$wt_path" status --porcelain 2>/dev/null)" ]; then
       printf "  ${GREEN}● Keep${NC}   ${BOLD}$wt_name${NC}\n"
       printf "           ${DIM}has uncommitted changes${NC}\n"
@@ -905,25 +924,88 @@ action_auto_cleanup() {
       continue
     fi
 
-    # Check merge status
+    # Activity age: most recent of the branch's last commit and the worktree mtime
+    # (a no-commit worktree's last commit is main's, so mtime is what counts).
+    local grace_days="${DEV_CLEANUP_GRACE_DAYS:-7}"
+    local now_ts last_commit wt_mtime last_active age_days
+    now_ts="$(date +%s)"
+    last_commit="$(git -C "$wt_path" log -1 --format=%ct 2>/dev/null || echo 0)"
+    wt_mtime="$(stat -f %m "$wt_path" 2>/dev/null || echo 0)"
+    last_active="$last_commit"
+    [ "$wt_mtime" -gt "$last_active" ] && last_active="$wt_mtime"
+    age_days=$(( (now_ts - last_active) / 86400 ))
+
+    # Ephemeral agent worktrees (.claude/worktrees/agent-*): reap past the grace
+    # threshold regardless of PR state — but never while their agent is still
+    # running, and (handled above) never when dirty.
+    case "$wt_path" in
+      */.claude/worktrees/agent-*)
+        if [ "$locked" = "1" ] && [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+          printf "  ${GREEN}● Keep${NC}   ${BOLD}$wt_name${NC}\n"
+          printf "           ${DIM}agent worktree — still running (pid $lock_pid)${NC}\n"
+          echo ""
+          kept=$((kept + 1))
+          continue
+        fi
+        if [ "$age_days" -lt "$grace_days" ]; then
+          printf "  ${GREEN}● Keep${NC}   ${BOLD}$wt_name${NC}\n"
+          printf "           ${DIM}agent worktree — active ${age_days}d ago (< ${grace_days}d grace)${NC}\n"
+          echo ""
+          kept=$((kept + 1))
+          continue
+        fi
+        if [ "$dry_run" = true ]; then
+          printf "  ${YELLOW}○ Would remove${NC}  ${BOLD}$wt_name${NC}\n"
+        else
+          printf "  ${RED}✕ Removing${NC}      ${BOLD}$wt_name${NC}\n"
+        fi
+        printf "           ${DIM}agent worktree — abandoned ${age_days}d ago (lock pid dead)${NC}\n"
+        if [ "$dry_run" = false ]; then
+          action_cleanup "$wt_name" 2>/dev/null
+        fi
+        removed=$((removed + 1))
+        echo ""
+        continue
+        ;;
+    esac
+
+    # Merge status (needs a real branch name)
     local merged=false
-    if git -C "$LUPA_REPO" branch --merged main 2>/dev/null | grep -qw "$branch"; then
-      merged=true
-    elif git -C "$LUPA_REPO" branch -r --merged origin/main 2>/dev/null | grep -qw "origin/$branch"; then
-      merged=true
+    if [ -n "$branch" ]; then
+      if git -C "$LUPA_REPO" branch --merged main 2>/dev/null | grep -qw "$branch"; then
+        merged=true
+      elif git -C "$LUPA_REPO" branch -r --merged origin/main 2>/dev/null | grep -qw "origin/$branch"; then
+        merged=true
+      fi
     fi
 
-    # Check PR status on GitHub
+    # PR status — only with a real branch (an empty --head makes `gh pr list`
+    # ignore the filter and return an unrelated newest PR).
     local pr_closed=false
     local pr_info pr_state pr_number pr_title
-    pr_info="$(gh pr list --repo "$GITHUB_REPO" --head "$branch" --state all --json state,number,title --jq '.[0]' 2>/dev/null || echo "")"
-    if [ -n "$pr_info" ] && [ "$pr_info" != "null" ]; then
-      pr_state="$(echo "$pr_info" | jq -r '.state // empty' 2>/dev/null)"
-      pr_number="$(echo "$pr_info" | jq -r '.number // empty' 2>/dev/null)"
-      pr_title="$(echo "$pr_info" | jq -r '.title // empty' 2>/dev/null)"
-      if [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ]; then
-        pr_closed=true
+    pr_state=""; pr_number=""; pr_title=""
+    if [ -n "$branch" ]; then
+      pr_info="$(gh pr list --repo "$GITHUB_REPO" --head "$branch" --state all --json state,number,title --jq '.[0]' 2>/dev/null || echo "")"
+      if [ -n "$pr_info" ] && [ "$pr_info" != "null" ]; then
+        pr_state="$(echo "$pr_info" | jq -r '.state // empty' 2>/dev/null)"
+        pr_number="$(echo "$pr_info" | jq -r '.number // empty' 2>/dev/null)"
+        pr_title="$(echo "$pr_info" | jq -r '.title // empty' 2>/dev/null)"
+        if [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ]; then
+          pr_closed=true
+        fi
       fi
+    fi
+
+    # Grace period applies ONLY to the false-positive merge case: a worktree the
+    # ancestry check flags as "merged into main" but with no terminal PR — i.e. an
+    # in-flight branch with no commits/PR yet. A real MERGED/CLOSED PR is a
+    # deliberate done-signal, so it's removed immediately regardless of age.
+    if [ "$merged" = true ] && [ "$pr_closed" = false ] && [ "$age_days" -lt "$grace_days" ]; then
+      printf "  ${GREEN}● Keep${NC}   ${BOLD}$wt_name${NC}\n"
+      printf "           ${DIM}merged into main (no PR), but active ${age_days}d ago (< ${grace_days}d grace)${NC}\n"
+      echo ""
+      kept=$((kept + 1))
+      continue
     fi
 
     if [ "$merged" = true ] || [ "$pr_closed" = true ]; then
@@ -959,11 +1041,18 @@ action_auto_cleanup() {
       echo ""
       kept=$((kept + 1))
     fi
-  done < <(git -C "$LUPA_REPO" worktree list)
+  done < <(git -C "$LUPA_REPO" worktree list --porcelain | awk '
+    function flush() { if (wt != "") print wt "\t" br "\t" locked "\t" pid; wt=""; br=""; locked="0"; pid="" }
+    /^worktree / { flush(); wt=$2 }
+    /^branch /   { br=$2; sub(/^refs\/heads\//, "", br) }
+    /^detached$/ { br="" }
+    /^locked/    { locked="1"; if (match($0, /pid [0-9]+/)) pid=substr($0, RSTART+4, RLENGTH-4) }
+    END { flush() }
+  ')
 
-  # Prune orphaned branches
+  # Prune orphaned branches (respects dry mode)
   printf "\n${BOLD}── Pruning orphaned branches ──${NC}\n"
-  action_prune_branches
+  action_prune_branches "$dry_run"
 
   echo ""
   if [ "$dry_run" = true ]; then

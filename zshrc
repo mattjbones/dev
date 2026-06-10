@@ -151,19 +151,6 @@ ar() {
 	eval "$(dev-aws "${1:-dev}")"
 }
 
-function ldev() {
-  tmux -CC new-session -d \; \
-  split-window -v -l 50% \; \
-  send-keys 'cd monorepo; nx localdev server' C-m \; \
-  split-window -v -l 33% \; \
-  send-keys 'cd monorepo; nx serve work' C-m \; \
-  split-window -v -l 16% \; \
-  send-keys 'cd monorepo; claude' C-m \; \
-  select-pane -t 0 \; \
-  attach
-}
-
-
 # pnpm
 export PNPM_HOME="$HOME/Library/pnpm"
 case ":$PATH:" in
@@ -205,3 +192,6 @@ if ! grep -q pinentry-mac ~/.gnupg/gpg-agent.conf 2>/dev/null; then
   echo "pinentry-program $(brew --prefix)/bin/pinentry-mac" >> ~/.gnupg/gpg-agent.conf
   gpgconf --kill gpg-agent
 fi
+
+
+export DD_SITE=datadoghq.eu
