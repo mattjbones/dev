@@ -193,5 +193,6 @@ if ! grep -q pinentry-mac ~/.gnupg/gpg-agent.conf 2>/dev/null; then
   gpgconf --kill gpg-agent
 fi
 
-
-export DD_SITE=datadoghq.eu
+# Machine-local env + secrets (DD_SITE, DD_API_KEY, …) — populated by the dev
+# bootstrap's secrets phase from Bitwarden. Lives outside the repo, never committed.
+[[ -f "$HOME/.config/dev/env" ]] && source "$HOME/.config/dev/env"
