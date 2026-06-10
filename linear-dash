@@ -1335,7 +1335,9 @@ if (ARGS.watch != null) {
   // Incremental search over the visible list. `active` = typing a query; matches
   // persist after Enter so n/N can cycle them.
   const search = { active: false, query: '', matches: [], origSel: 0 };
-  const listHint = '  j/k · / search · ↵ details · h/l section · m extras · q quit';
+  let refreshing = false; // a compute() is in flight
+  let manualRefresh = false; // user pressed r — show a transient indicator
+  const listHint = '  j/k · / search · ↵ details · r refresh · m extras · q quit';
   const detailsHint = '  j/k scroll · g/G ends · r refresh · esc back · q quit';
   const halfPage = () => Math.max(1, Math.floor(((process.stdout.rows || 40) - 4) / 2));
   // Home, redraw with each line cleared to its end (\x1b[K) so a shorter line never
@@ -1368,20 +1370,46 @@ if (ARGS.watch != null) {
     } else if (search.matches.length) {
       hint = `  /${search.query} · ${search.matches.length} matches · n/N next · esc clear · ↵ details · q quit`;
     }
+    if (manualRefresh) {
+      hint += '  · ⟳ refreshing…';
+    }
     writeFrame(viewport(lastItems, nav, process.stdout.rows, process.stdout.columns, hint));
   };
   const repaint = paintScreen;
 
+  let timer = null;
   const tick = async () => {
+    if (refreshing) {
+      return; // a fetch is already in flight; don't overlap
+    }
+    refreshing = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (manualRefresh && view === 'list' && last) {
+      repaint(); // show the ⟳ indicator over current data while we fetch
+    }
     try {
       last = await compute();
+      manualRefresh = false;
       repaint();
     } catch (err) {
+      manualRefresh = false;
       if (view === 'list') {
         writeFrame(red(`Error: ${err.message}`));
       }
     }
-    setTimeout(tick, interval);
+    refreshing = false;
+    timer = setTimeout(tick, interval);
+  };
+  // Force an immediate refresh (r on the list); no-op if a fetch is already running.
+  const refreshNow = () => {
+    if (refreshing) {
+      return;
+    }
+    manualRefresh = true;
+    tick();
   };
 
   // Fetch (or refetch) the current item's details, showing Loading… until it lands.
@@ -1554,6 +1582,10 @@ if (ARGS.watch != null) {
       search.query = '';
       search.matches = [];
       repaint();
+      return;
+    }
+    if (key === 'r') {
+      refreshNow();
       return;
     }
     if (key === 'm' || key === 'M') {
