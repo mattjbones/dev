@@ -192,3 +192,6 @@ if ! grep -q pinentry-mac ~/.gnupg/gpg-agent.conf 2>/dev/null; then
   echo "pinentry-program $(brew --prefix)/bin/pinentry-mac" >> ~/.gnupg/gpg-agent.conf
   gpgconf --kill gpg-agent
 fi
+
+
+export DD_SITE=datadoghq.eu
