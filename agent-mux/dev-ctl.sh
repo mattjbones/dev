@@ -645,10 +645,14 @@ action_cleanup() {
   local cleanup_started_at
   cleanup_started_at="$(date +%s)"
   write_cleanup_status "$name" "Stopping docker" "$cleanup_started_at"
-  trap 'rm -f "$cleanup_file"' EXIT
+  # `${cleanup_file:-}` so this never trips `set -u` if it somehow fires after the
+  # function has returned (the var is a local); normal/early exits clear it below.
+  trap 'rm -f "${cleanup_file:-}"' EXIT
 
   if [ "$name" = "lupa" ]; then
     echo "Skipping main repo cleanup"
+    rm -f "$cleanup_file"
+    trap - EXIT
     return
   fi
 
@@ -728,6 +732,8 @@ action_cleanup() {
     fi
   done <<< "$branches_to_check"
 
+  rm -f "$cleanup_file"
+  trap - EXIT
   echo "Done — '$name' fully cleaned up"
 }
 
