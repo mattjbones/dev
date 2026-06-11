@@ -9,6 +9,7 @@ assert() {
   if "$@"; then PASS=$((PASS + 1)); echo "  ok: $desc"
   else FAIL=$((FAIL + 1)); echo "  FAIL: $desc"; fi
 }
+not_grep() { ! grep -q "$1" <<<"$2"; }
 
 assert "--help exits 0" ./bootstrap.sh --help
 assert "unknown flag exits 1" test "$(./bootstrap.sh --bogus >/dev/null 2>&1; echo $?)" = 1
@@ -17,7 +18,7 @@ out=$(./bootstrap.sh --dry-run --tier 1 --yes)
 assert "dry-run announces itself" grep -q 'DRY RUN' <<<"$out"
 assert "tier 1 runs prereqs" grep -q '00-prereqs' <<<"$out"
 assert "tier 1 runs dotfiles" grep -q '20-dotfiles' <<<"$out"
-assert "tier 1 excludes tier-2 phases" bash -c "! grep -q '30-' <<<'$out'"
+assert "tier 1 excludes tier-2 phases" not_grep '30-' "$out"
 
 out=$(./bootstrap.sh --dry-run --only dotfiles --yes)
 assert "--only filters to one phase" grep -q '\[1/1\] 20-dotfiles' <<<"$out"

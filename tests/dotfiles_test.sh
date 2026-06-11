@@ -15,7 +15,9 @@ check test -L "$tmp/.claude/CLAUDE.md"
 check grep -q '⟳' <<<"$out1"                       # first run applies
 
 out2=$(HOME="$tmp" ./bootstrap.sh --only dotfiles --yes)
-check bash -c "! grep -q '⟳' <<<'$out2'"           # second run all ✓ (idempotent)
+# shellcheck disable=SC2329  # invoked indirectly via check
+not_grep() { ! grep -q "$1" <<<"$2"; }
+check not_grep '⟳' "$out2"                         # second run all ✓ (idempotent)
 
 # real-file conflict -> backed up, then linked
 rm "$tmp/.zshrc"; echo real > "$tmp/.zshrc"
