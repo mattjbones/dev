@@ -14,7 +14,6 @@ brew "claude-code"
 brew "dnsmasq"
 brew "ffmpeg"
 brew "fzf"
-brew "gastown", link: false
 brew "gh"
 brew "git-lfs"
 brew "gnupg"
