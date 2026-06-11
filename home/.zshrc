@@ -178,7 +178,6 @@ source <(fzf --zsh)
 alias cat=bat
 
 export AWS_REGION=eu-west-2
-export LINEAR_DASH_PROJECT=6d12683f-9ff0-4318-8612-9175e03fa0ce
 
 # Default Brewfile for `brew bundle` (lives in this repo)
 export HOMEBREW_BUNDLE_FILE="$HOME/workspace/dev/Brewfile"
