@@ -13,6 +13,9 @@ This keeps them in OneDrive so they sync to my other machines and I can edit the
 **Do NOT commit specs/plans into the project repo.** They live only in OneDrive. Skip the
 brainstorming skill's "commit the spec" step — write the file, report the path, and stop.
 
-**Archiving:** when a piece of work is complete, move its spec and plan into the `archive/`
-subfolder of their respective directories (`specs/archive/`, `plans/archive/`). When looking
-for past specs/plans, check `archive/` too.
+**Archiving:** move a spec/plan into the `archive/` subfolder of its directory
+(`specs/archive/`, `plans/archive/`) only once the work it describes has shipped —
+implementation complete and merged. A finished document is not finished work: a spec
+whose implementation hasn't happened yet stays in the active folder. If unsure whether
+something shipped, check the repo (or ask) before archiving. When looking for past
+specs/plans, check `archive/` too.
