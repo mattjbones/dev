@@ -250,6 +250,17 @@ WORKSPACE_NAME="$(basename "$WORKTREE")"
 MONOREPO="$WORKTREE/monorepo"
 SESSION="$WORKSPACE_NAME"
 
+# Sync workspace state to OneDrive (best-effort, never blocks dev startup):
+# reconcile tags sessions closed since last invocation as inactive, record
+# upserts this one as active so another machine can `dev-session-sync restore`.
+SESSION_SYNC_SCRIPT="$SCRIPT_DIR/dev-session-sync.sh"
+sync_session_state() {
+  if [ -x "$SESSION_SYNC_SCRIPT" ]; then
+    "$SESSION_SYNC_SCRIPT" reconcile 2>/dev/null || true
+    "$SESSION_SYNC_SCRIPT" record "$SESSION" "$BRANCH" "$WORKTREE" "$MODEL" 2>/dev/null || true
+  fi
+}
+
 if [ ! -d "$MONOREPO" ]; then
   echo "Error: monorepo dir not found at '$MONOREPO'"
   exit 1
@@ -258,6 +269,7 @@ fi
 # Reattach if session already exists
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "Session '$SESSION' already exists, reattaching..."
+  sync_session_state
   exec tmux attach-session -t "$SESSION"
 fi
 
@@ -266,6 +278,14 @@ ensure_monorepo_deps "$WORKTREE"
 # Create session with first pane: agent
 tmux new-session -d -s "$SESSION" -c "$WORKTREE" -n "dev"
 propagate_cmux_env "$SESSION"
+sync_session_state
+
+# Tag sessions inactive in the OneDrive manifest as soon as they close
+# (reconcile on the next dev invocation catches anything this hook misses,
+# e.g. a crashed tmux server).
+if [ -x "$SESSION_SYNC_SCRIPT" ]; then
+  tmux set-hook -g session-closed "run-shell '$SESSION_SYNC_SCRIPT reconcile'"
+fi
 
 # Enable pane titles in status bar (must be after session exists)
 tmux set-option -g pane-border-status top
