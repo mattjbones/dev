@@ -20,9 +20,12 @@ Idempotent — re-running converges and never clobbers. Flags:
 | `--force` | re-pull/re-render even when dest exists |
 | `--no-backup` | overwrite conflicting real files instead of backing up to `.bak` |
 
-Currently implemented: **Tiers 1–2** (Xcode CLT, Homebrew + Brewfile, node via
-nvm/corepack, dotfile symlinks, Bitwarden-driven secrets, Zed/cmux/Raycast
-configs). Tier 3 (macOS defaults) is upcoming.
+**All tiers implemented** (Xcode CLT, Homebrew + Brewfile, shell framework,
+node via nvm/corepack, dotfile symlinks, Bitwarden-driven secrets,
+Zed/cmux/Raycast configs, macOS defaults). The defaults
+list lives in `macos/defaults.sh` (one commented line per setting); the
+phase applies only diffs and restarts Dock/Finder only when something
+actually changed.
 
 ## Layout
 
