@@ -53,5 +53,22 @@ assert "dry-run creates nothing" test ! -e "$dest3"
 assert "gate passes with YES=1" env YES=1 bash -c 'source lib/common.sh; gate "q?"'
 assert "gate passes with DRY_RUN=1" env DRY_RUN=1 bash -c 'source lib/common.sh; gate "q?"'
 
+# env_set: creates file (mode 600) with one export line
+envfile="$tmp/home/.config/dev/env"
+env_set DD_API_KEY secret1 "$envfile" >/dev/null
+assert "env_set creates export line" grep -q "^export DD_API_KEY='secret1'$" "$envfile"
+assert "env_set sets mode 600" test "$(stat -f %Lp "$envfile")" = 600
+
+# env_set: replaces existing line, no duplicates, preserves other lines
+env_set DD_SITE site1 "$envfile" >/dev/null
+env_set DD_API_KEY secret2 "$envfile" >/dev/null
+assert "env_set replaces value" grep -q "^export DD_API_KEY='secret2'$" "$envfile"
+assert "env_set no duplicates" test "$(grep -c '^export DD_API_KEY=' "$envfile")" = 1
+assert "env_set preserves other vars" grep -q "^export DD_SITE='site1'$" "$envfile"
+
+# env_set: dry-run touches nothing
+DRY_RUN=1 env_set NEW_VAR x "$tmp/home/.config/dev/env2" >/dev/null
+assert "env_set dry-run creates nothing" test ! -e "$tmp/home/.config/dev/env2"
+
 echo "passed $PASS, failed $FAIL"
 [[ $FAIL -eq 0 ]]
