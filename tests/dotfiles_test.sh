@@ -12,6 +12,7 @@ check() { "$@" || { echo "  FAIL: $*"; fail=1; }; }
 out1=$(HOME="$tmp" ./bootstrap.sh --only dotfiles --yes)
 check test -L "$tmp/.zshrc"
 check test -L "$tmp/.claude/CLAUDE.md"
+check test ! -e "$tmp/.config/cmux/settings.json.tmpl"   # templates are not dotfiles
 check grep -q '⟳' <<<"$out1"                       # first run applies
 
 out2=$(HOME="$tmp" ./bootstrap.sh --only dotfiles --yes)
