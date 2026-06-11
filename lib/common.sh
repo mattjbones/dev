@@ -54,3 +54,38 @@ backup_then_link() {
   fi
   run ln -sfn "$src" "$dest"
 }
+
+# env_set <var> <value> <dest> — maintain one `export VAR='value'` line per
+# var in dest (mode 600). How secret-paired shell env reaches the shell:
+# dest is sourced by zshrc and never committed.
+env_set() {
+  local var=$1 value=$2 dest=$3 tmp
+  if [[ "${DRY_RUN:-0}" == 1 ]]; then
+    log "  (dry-run) set $var in $dest"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  tmp="$(mktemp)"
+  if [[ -f "$dest" ]]; then grep -v "^export $var=" "$dest" > "$tmp" || true; fi
+  printf "export %s='%s'\n" "$var" "${value//\'/\'\\\'\'}" >> "$tmp"
+  install -m 600 "$tmp" "$dest"
+  rm -f "$tmp"
+  apply "set $var in $dest"
+}
+
+# Bitwarden — GUI sign-in is the manual root of trust; the CLI is what we drive.
+bw_ensure_unlocked() {
+  command -v bw >/dev/null 2>&1 || { warn "bw CLI missing — run the brew phase first"; return 1; }
+  bw login --check >/dev/null 2>&1 || bw login
+  BW_SESSION="$(bw unlock --raw)"
+  [[ -n "$BW_SESSION" ]] || return 1
+  export BW_SESSION
+}
+bw_item_id() { bw get item "$1" 2>/dev/null | jq -r '.id // empty'; }
+bw_get_field() { bw get item "$1" 2>/dev/null | jq -r --arg n "$2" '.fields[]? | select(.name == $n) | .value'; }
+bw_get_attachment() { # <item> <source> <dest>
+  local id
+  id="$(bw_item_id "$1")"
+  [[ -n "$id" ]] || return 1
+  bw get attachment "$2" --itemid "$id" --output "$3" >/dev/null
+}
