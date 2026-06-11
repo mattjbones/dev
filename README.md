@@ -42,19 +42,24 @@ Pulled from Bitwarden at apply time by `phases/30-secrets.sh`, driven by
 install the Bitwarden GUI app and sign in (root of trust), then the script
 drives the `bw` CLI (unlock prompt during the run).
 
-Vault convention — items the manifest expects:
+Vault convention — items the manifest expects. Free-tier friendly: secrets
+live in secure-note *bodies* and hidden custom fields (attachments are a
+Bitwarden Premium feature). `./scripts/seed-vault.sh` creates these as
+REPLACE_ME skeletons:
 
-| Item | Type | Holds |
-| --- | --- | --- |
-| `ssh-personal` | attachments | `id_ed25519`, `id_ed25519.pub` |
-| `gpg-personal` | attachment | `private.asc` (GPG private key export) |
-| `cmux` | custom field | `socketPassword` |
-| `raycast` | attachment | `raycast.rayconfig` (settings export) |
-| `datadog` | custom fields | `DD_API_KEY`, `DD_SITE` |
+| Item | Where the secret lives |
+| --- | --- |
+| `ssh-id_ed25519` | note body: SSH private key (plain text) |
+| `ssh-id_ed25519.pub` | note body: SSH public key line |
+| `gpg-private` | note body: ASCII-armored GPG export (`gpg --export-secret-keys --armor`) |
+| `raycast` | note body: base64 of a settings export (`base64 -i <file>.rayconfig \| pbcopy`) |
+| `cmux` | hidden field `socketPassword` |
+| `datadog` | hidden fields `DD_API_KEY`, `DD_SITE` |
 
-Missing items warn and are skipped — create them and re-run (`--force` to
-re-pull existing dests). Field values land in `~/.config/dev/env` (mode 600,
-sourced by zshrc, never committed). AWS is via SSO (`ar` helper), not Bitwarden.
+Missing items and untouched REPLACE_ME placeholders warn and are skipped —
+fill them in and re-run (`--force` to re-pull existing dests). Field values
+land in `~/.config/dev/env` (mode 600, sourced by zshrc, never committed).
+AWS is via SSO (`ar` helper), not Bitwarden.
 
 ## One-time on an existing machine
 

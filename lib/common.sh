@@ -81,11 +81,5 @@ bw_ensure_unlocked() {
   [[ -n "$BW_SESSION" ]] || return 1
   export BW_SESSION
 }
-bw_item_id() { bw get item "$1" 2>/dev/null | jq -r '.id // empty'; }
 bw_get_field() { bw get item "$1" 2>/dev/null | jq -r --arg n "$2" '.fields[]? | select(.name == $n) | .value'; }
-bw_get_attachment() { # <item> <source> <dest>
-  local id
-  id="$(bw_item_id "$1")"
-  [[ -n "$id" ]] || return 1
-  bw get attachment "$2" --itemid "$id" --output "$3" >/dev/null
-}
+bw_get_notes() { bw get item "$1" 2>/dev/null | jq -r '.notes // empty'; }

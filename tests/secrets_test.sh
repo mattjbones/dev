@@ -19,6 +19,7 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 stub="$tmp/stub"; mkdir -p "$stub"
 export GPG_STATE="$tmp/gpg-state" GPG_LOG="$tmp/gpg-log"
 
+# ZmFrZS1yYXljb25maWc= is base64("fake-rayconfig")
 cat > "$stub/bw" <<'EOF'
 #!/usr/bin/env bash
 case "$1 ${2:-}" in
@@ -26,18 +27,14 @@ case "$1 ${2:-}" in
   "unlock --raw") echo fake-session ;;
   "get item")
     case $3 in
-      ssh-personal) echo '{"id":"id-ssh","fields":[]}' ;;
-      gpg-personal) echo '{"id":"id-gpg","fields":[]}' ;;
-      cmux)         echo '{"id":"id-cmux","fields":[{"name":"socketPassword","value":"sekret-sock"}]}' ;;
-      raycast)      echo '{"id":"id-ray","fields":[]}' ;;
-      datadog)      echo '{"id":"id-dd","fields":[{"name":"DD_API_KEY","value":"dd-key-123"},{"name":"DD_SITE","value":"datadoghq.eu"}]}' ;;
+      ssh-id_ed25519)     echo '{"id":"id-ssh","notes":"fake-ssh-private-key","fields":[]}' ;;
+      ssh-id_ed25519.pub) echo '{"id":"id-pub","notes":"fake-ssh-public-key","fields":[]}' ;;
+      gpg-private)        echo '{"id":"id-gpg","notes":"fake-gpg-key","fields":[]}' ;;
+      cmux)               echo '{"id":"id-cmux","notes":null,"fields":[{"name":"socketPassword","value":"sekret-sock"}]}' ;;
+      raycast)            echo '{"id":"id-ray","notes":"ZmFrZS1yYXljb25maWc=","fields":[]}' ;;
+      datadog)            echo '{"id":"id-dd","notes":null,"fields":[{"name":"DD_API_KEY","value":"dd-key-123"},{"name":"DD_SITE","value":"datadoghq.eu"}]}' ;;
       *) exit 1 ;;
     esac ;;
-  "get attachment")
-    src=$3; out=''
-    shift 3
-    while [[ $# -gt 0 ]]; do [[ $1 == --output ]] && out=$2; shift; done
-    mkdir -p "$(dirname "$out")" && echo "fake-$src" > "$out" ;;
   lock*) exit 0 ;;
   *) exit 1 ;;
 esac
@@ -53,14 +50,15 @@ chmod +x "$stub/bw" "$stub/gpg"
 export PATH="$stub:$PATH"
 
 out1=$(HOME="$tmp/home" ./bootstrap.sh --only secrets --yes 2>&1)
-assert "ssh key written" test "$(cat "$tmp/home/.ssh/id_ed25519" 2>/dev/null)" = "fake-id_ed25519"
+assert "ssh key written from note body" test "$(cat "$tmp/home/.ssh/id_ed25519" 2>/dev/null)" = "fake-ssh-private-key"
 assert "ssh key mode 600" test "$(stat -f %Lp "$tmp/home/.ssh/id_ed25519")" = 600
 assert "ssh pub mode 644" test "$(stat -f %Lp "$tmp/home/.ssh/id_ed25519.pub")" = 644
+assert "raycast staged (note64 decoded)" does_grep 'raycast.rayconfig (600)' "$out1"
 assert "env file has DD_API_KEY" grep -q "^export DD_API_KEY='dd-key-123'$" "$tmp/home/.config/dev/env"
 assert "env file has DD_SITE" grep -q "^export DD_SITE='datadoghq.eu'$" "$tmp/home/.config/dev/env"
 assert "env file mode 600" test "$(stat -f %Lp "$tmp/home/.config/dev/env")" = 600
 assert "gpg key imported" grep -q -- '--import' "$GPG_LOG"
-assert "no secret values in output" not_grep 'dd-key-123\|sekret-sock' "$out1"
+assert "no secret values in output" not_grep 'dd-key-123\|sekret-sock\|fake-ssh-private' "$out1"
 
 out2=$(HOME="$tmp/home" ./bootstrap.sh --only secrets --yes 2>&1)
 assert "second run skips ssh" not_grep 'wrote.*id_ed25519 ' "$out2"
@@ -72,6 +70,21 @@ assert "--force re-pulls ssh" does_grep 'wrote.*id_ed25519' "$out3"
 
 out4=$(HOME="$tmp/home" ./bootstrap.sh --only secrets --yes --dry-run 2>&1)
 assert "dry-run lists pulls" does_grep 'dry-run.*id_ed25519' "$out4"
+
+# placeholder guard: REPLACE_ME values must never reach disk
+cat > "$stub/bw" <<'EOF'
+#!/usr/bin/env bash
+case "$1 ${2:-}" in
+  "login --check") exit 0 ;;
+  "unlock --raw") echo fake-session ;;
+  "get item") echo '{"id":"x","notes":"REPLACE_ME — fill me in","fields":[{"name":"socketPassword","value":"REPLACE_ME"},{"name":"DD_API_KEY","value":"REPLACE_ME"},{"name":"DD_SITE","value":"REPLACE_ME"}]}' ;;
+  lock*) exit 0 ;;
+  *) exit 1 ;;
+esac
+EOF
+out5=$(HOME="$tmp/home2" ./bootstrap.sh --only secrets --yes 2>&1)
+assert "placeholder never written" test ! -e "$tmp/home2/.ssh/id_ed25519"
+assert "placeholder warns" does_grep 'no real value' "$out5"
 
 echo "passed $PASS, failed $FAIL"
 [[ $FAIL -eq 0 ]]
