@@ -36,7 +36,17 @@ export REPO_ROOT TIER ONLY DRY_RUN YES FORCE NO_BACKUP
 # Run-level temp shared by all phases (spec: secrets stage artifacts for apps).
 BOOTSTRAP_TMP="$(mktemp -d -t dev-bootstrap)"
 export BOOTSTRAP_TMP
-trap 'rm -rf "$BOOTSTRAP_TMP"' EXIT
+cleanup() {
+  if [[ -n "${BW_SESSION:-}" ]]; then
+    bw lock >/dev/null 2>&1 || true
+    unset BW_SESSION
+  fi
+  if [[ -d "$BOOTSTRAP_TMP" ]]; then
+    find "$BOOTSTRAP_TMP" -type f -exec rm -P {} + 2>/dev/null  # overwrite key-bearing temps
+    rm -rf "$BOOTSTRAP_TMP"
+  fi
+}
+trap cleanup EXIT
 
 # Phase prefix -> tier: 00-29 tier 1, 30-49 tier 2, 50+ tier 3.
 phase_tier() {
