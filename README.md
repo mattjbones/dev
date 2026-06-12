@@ -33,7 +33,9 @@ actually changed.
 - `lib/common.sh` — shared helpers (logging, gates, backup-then-link)
 - `home/` — mirrors `$HOME`; every file here is symlinked into place by the dotfiles phase
 - `tests/` — plain-bash tests; run `bash tests/<name>_test.sh`
-- `agent-mux/`, `linear-dash`, `scripts/` — standalone tooling (unchanged)
+- `agent-mux/` — tmux multi-worktree dev environment (`dev`, `dev ctl`,
+  `dev sync` + cross-machine Claude chat resume) — see [its README](agent-mux/README.md)
+- `linear-dash`, `scripts/` — standalone tooling (`dev-aws.sh` AWS SSO creds, `seed-vault.sh`)
 
 ## Secrets (Tier 2)
 
