@@ -109,12 +109,18 @@ Options:
 
 Environment:
   DEV_TMUX_NO_ATTACH=1       Create the tmux session but do not attach (dev-ctl.sh)
+  DEV_CLAUDE_SESSION_ID=<id> Claude Code session uuid for the agent pane; resumes
+                             that chat if its transcript exists locally
+                             (set by dev-session-sync.sh restore)
   DEV_SKIP_PNPM_INSTALL=1    Do not start a per-worktree pnpm install when
                              monorepo/node_modules is missing
 
 Commands:
   ctl, control [args...]  Run dev-ctl (same as $SCRIPT_DIR/dev-ctl.sh). Extra args
                           are forwarded (e.g. ctl list, ctl new my-branch).
+  sync                    Pick sessions active on another machine (fzf: TAB some,
+                          ctrl-a all) and restore them here, resuming each
+                          session's Claude chat from its synced transcript.
 
 In tmux: Ctrl-a W opens the dev-ctl command centre ($SCRIPT_DIR/dev-ctl.sh).
 
@@ -198,6 +204,10 @@ case "${1:-}" in
     shift
     exec "$SCRIPT_DIR/dev-ctl.sh" "$@"
     ;;
+  sync)
+    shift
+    exec "$SCRIPT_DIR/dev-session-sync.sh" sync "$@"
+    ;;
 esac
 
 if [ "${1:-}" = "--" ]; then
@@ -262,7 +272,8 @@ SESSION_SYNC_SCRIPT="$SCRIPT_DIR/dev-session-sync.sh"
 sync_session_state() {
   if [ -x "$SESSION_SYNC_SCRIPT" ]; then
     "$SESSION_SYNC_SCRIPT" reconcile 2>/dev/null || true
-    "$SESSION_SYNC_SCRIPT" record "$SESSION" "$BRANCH" "$WORKTREE" "$MODEL" 2>/dev/null || true
+    "$SESSION_SYNC_SCRIPT" record "$SESSION" "$BRANCH" "$WORKTREE" "$MODEL" \
+      "${CLAUDE_SESSION_ID:-}" 2>/dev/null || true
   fi
 }
 
@@ -279,6 +290,15 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
 fi
 
 ensure_monorepo_deps "$WORKTREE"
+
+# Pin the Claude Code session id so the chat in the agent pane can be resumed
+# later (recorded in the OneDrive manifest; restore passes it back in via
+# DEV_CLAUDE_SESSION_ID). The launch script resumes if a local transcript for
+# the id exists, otherwise starts fresh under this id.
+CLAUDE_SESSION_ID=""
+if [ "$MODEL" = "claude" ]; then
+  CLAUDE_SESSION_ID="${DEV_CLAUDE_SESSION_ID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}"
+fi
 
 # Create session with first pane: agent
 tmux new-session -d -s "$SESSION" -c "$WORKTREE" -n "dev"
@@ -317,7 +337,7 @@ case "$MODEL" in
     ;;
 esac
 
-AGENT_CMD="$AGENT_LAUNCH_SCRIPT $MODEL"
+AGENT_CMD="$AGENT_LAUNCH_SCRIPT $MODEL${CLAUDE_SESSION_ID:+ $CLAUDE_SESSION_ID}"
 
 tmux select-pane -t "$SESSION:.0" -T "$AGENT_ICON $AGENT_LABEL"
 send_keys_when_ready "$SESSION:.0" "$AGENT_CMD"
