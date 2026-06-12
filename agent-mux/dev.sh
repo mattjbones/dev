@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./dev.sh [--model claude|codex] [--no-docker] [branch-name]
+# Usage: ./dev.sh [--model claude|codex] [--docker] [branch-name]
 #        ./dev.sh ctl|control [args...]   → dev-ctl.sh (workspace picker / subcommands)
 # Resolves <branch-name> via git worktree list, ~/workspace/<name>, or
 # lupa/.claude/worktrees/<name>; otherwise adds ~/workspace/<name> off main.
@@ -9,7 +9,7 @@ set -euo pipefail
 #
 # Flags:
 #   --model claude|codex   Agent to run in the left pane (default: claude)
-#   --no-docker            Skip docker-start.sh (bare terminal instead)
+#   --docker               Run docker-start.sh (default: off, bare terminal)
 
 # Real directory of this script (works when invoked via symlink, e.g. ~/bin/dev).
 _dev_source="${BASH_SOURCE[0]:-$0}"
@@ -102,7 +102,8 @@ build (optional Docker), and shell. With no branch name, uses the main lupa chec
 
 Options:
   --model claude|codex   Agent in the first pane (default: claude)
-  --no-docker            Do not run ./docker/docker-start.sh in the build pane
+  --docker               Run ./docker/docker-start.sh in the build pane (default: off)
+  --no-docker            Do not run ./docker/docker-start.sh in the build pane (default)
   --services LIST        Accepted; not passed to docker-start (worktree name only)
   -h, --help             Show this help
 
@@ -159,7 +160,7 @@ propagate_cmux_env() {
 }
 
 MODEL="claude"
-USE_DOCKER=true
+USE_DOCKER=false
 SERVICES="server"
 
 # Parse flags
@@ -172,6 +173,10 @@ while [[ "${1:-}" == -* ]]; do
     --model)
       MODEL="${2:-claude}"
       shift 2
+      ;;
+    --docker)
+      USE_DOCKER=true
+      shift
       ;;
     --no-docker)
       USE_DOCKER=false
