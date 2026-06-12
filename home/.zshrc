@@ -210,3 +210,10 @@ fi
 # Machine-local env + secrets (DD_SITE, DD_API_KEY, …) — populated by the dev
 # bootstrap's secrets phase from Bitwarden. Lives outside the repo, never committed.
 [[ -f "$HOME/.config/dev/env" ]] && source "$HOME/.config/dev/env"
+
+# Raise the open-files soft limit — low defaults trip up pnpm/vite/watchman in
+# the monorepo ("too many open files"). Builtin, so effectively free; guarded
+# so we never lower an already-higher limit and stay quiet if the hard cap blocks it.
+if [[ "$(ulimit -n)" != "unlimited" ]] && (( $(ulimit -n) < 65536 )); then
+  ulimit -n 65536 2>/dev/null
+fi
