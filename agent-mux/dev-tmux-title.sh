@@ -150,21 +150,53 @@ WORKSPACE_TITLE="$(printf '%s' "$WORKSPACE_TITLE" | sed 's/^ *//;s/  */ /g')"
 tmux set-option -t "$SESSION" -q set-titles-string "$WORKSPACE_TITLE" 2>/dev/null
 
 # --- Mirror the same state into CMUX when available ---
+# Each cmux_run spawns a CLI process that connects to the cmux.app socket, and the daemon
+# spikes hard per push. With one session per worktree this floods cmux. Two guards:
+#   1. Skip entirely when nothing changed since the last push (idle sessions go quiet).
+#   2. Rate-limit: even when state changes, push at most once per CMUX_MIN_INTERVAL. An
+#      active agent's captured status line ("Thinking", ticking tokens) changes every poll,
+#      so without this the signature differs every cycle and guard 1 never fires.
+# Unchanged state still re-pushes after CMUX_TTL so cmux self-heals if it restarted.
+CMUX_MIN_INTERVAL=30
+CMUX_TTL=60
 if cmux_available; then
-  cmux_run rename-workspace "$WORKSPACE_TITLE" || true
+  CMUX_SIG="${WORKSPACE_TITLE}|${AGENT_PANE_TITLE}|${BUILD_STATUS_VALUE}|${CONTEXT_STATUS_VALUE}|${PERCENT}"
+  SIG_FILE="/tmp/dev-tmux-title/${WORKSPACE_NAME}-cmux-sig"
+  mkdir -p /tmp/dev-tmux-title 2>/dev/null
 
-  cmux_run set-status agent "${AGENT_PANE_TITLE#${AGENT_ICON} }" --icon sparkle --color "#34c759" || true
-  cmux_run set-status build "$BUILD_STATUS_VALUE" --icon shippingbox --color "#0a84ff" || true
+  CMUX_CACHED=""
+  [ -f "$SIG_FILE" ] && CMUX_CACHED="$(cat "$SIG_FILE" 2>/dev/null)"
+  CMUX_MTIME="$(stat -f %m "$SIG_FILE" 2>/dev/null || echo 0)"
+  CMUX_NOW="$(date +%s)"
+  CMUX_ELAPSED=$(( CMUX_NOW - CMUX_MTIME ))
 
-  if [ -n "$CONTEXT_STATUS_VALUE" ]; then
-    cmux_run set-status context "$CONTEXT_STATUS_VALUE" --icon gauge --color "#ff9f0a" || true
+  CMUX_PUSH=false
+  if [ "$CMUX_CACHED" != "$CMUX_SIG" ]; then
+    # Changed - push, but no more often than once per CMUX_MIN_INTERVAL per workspace.
+    [ "$CMUX_ELAPSED" -ge "$CMUX_MIN_INTERVAL" ] && CMUX_PUSH=true
   else
-    cmux_run clear-status context || true
+    # Unchanged - re-push only after the TTL so cmux state self-heals after a restart.
+    [ "$CMUX_ELAPSED" -ge "$CMUX_TTL" ] && CMUX_PUSH=true
   fi
 
-  if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]]; then
-    cmux_run set-progress "$(awk "BEGIN { printf \"%.2f\", $PERCENT / 100 }")" --label "${PERCENT}%" || true
-  else
-    cmux_run clear-progress || true
+  if [ "$CMUX_PUSH" = true ]; then
+    cmux_run rename-workspace "$WORKSPACE_TITLE" || true
+
+    cmux_run set-status agent "${AGENT_PANE_TITLE#${AGENT_ICON} }" --icon sparkle --color "#34c759" || true
+    cmux_run set-status build "$BUILD_STATUS_VALUE" --icon shippingbox --color "#0a84ff" || true
+
+    if [ -n "$CONTEXT_STATUS_VALUE" ]; then
+      cmux_run set-status context "$CONTEXT_STATUS_VALUE" --icon gauge --color "#ff9f0a" || true
+    else
+      cmux_run clear-status context || true
+    fi
+
+    if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]]; then
+      cmux_run set-progress "$(awk "BEGIN { printf \"%.2f\", $PERCENT / 100 }")" --label "${PERCENT}%" || true
+    else
+      cmux_run clear-progress || true
+    fi
+
+    printf '%s' "$CMUX_SIG" > "$SIG_FILE" 2>/dev/null || true
   fi
 fi
