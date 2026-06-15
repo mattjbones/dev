@@ -108,14 +108,12 @@ elif [ -n "$SERVER_ICON" ]; then
     BUILD_STATUS_VALUE="server"
   fi
 fi
-tmux select-pane -t "$SESSION:.1" -T "$BUILD_PANE_TITLE" 2>/dev/null
 
 # --- Update agent pane title with context percentage ---
 AGENT_PANE_TITLE="${AGENT_ICON} ${AGENT_LABEL:-agent}"
 if [ -n "$TOKEN_INFO" ]; then
   AGENT_PANE_TITLE="${AGENT_PANE_TITLE} ·${TOKEN_INFO}"
 fi
-tmux select-pane -t "$SESSION:.0" -T "$AGENT_PANE_TITLE" 2>/dev/null
 
 # --- Claude activity status from pane capture ---
 CLAUDE_STATUS=""
@@ -147,39 +145,45 @@ fi
 WORKSPACE_TITLE="${SERVER_ICON} ${AGENT_ICON} ${WORKSPACE_NAME}${CLAUDE_STATUS}${TOKEN_INFO}"
 WORKSPACE_TITLE="$(printf '%s' "$WORKSPACE_TITLE" | sed 's/^ *//;s/  */ /g')"
 
-tmux set-option -t "$SESSION" -q set-titles-string "$WORKSPACE_TITLE" 2>/dev/null
-
-# --- Mirror the same state into CMUX when available ---
-# Each cmux_run spawns a CLI process that connects to the cmux.app socket, and the daemon
-# spikes hard per push. With one session per worktree this floods cmux. Two guards:
+# --- Push state to the terminal titles and cmux, change-detected + rate-limited ---
+# Updating the window title (set-titles-string) every poll is the single biggest cost here:
+# each OSC title escape makes the host terminal - cmux especially - do heavy work, so one
+# session per worktree refreshing every cycle pegged the cmux daemon. The cmux_run pushes
+# spawn a CLI process each and spike the daemon too. Both sinks share the same volatile
+# inputs, so gate them together:
 #   1. Skip entirely when nothing changed since the last push (idle sessions go quiet).
-#   2. Rate-limit: even when state changes, push at most once per CMUX_MIN_INTERVAL. An
+#   2. Rate-limit: even when state changes, push at most once per STATE_MIN_INTERVAL. An
 #      active agent's captured status line ("Thinking", ticking tokens) changes every poll,
 #      so without this the signature differs every cycle and guard 1 never fires.
-# Unchanged state still re-pushes after CMUX_TTL so cmux self-heals if it restarted.
-CMUX_MIN_INTERVAL=30
-CMUX_TTL=60
-if cmux_available; then
-  CMUX_SIG="${WORKSPACE_TITLE}|${AGENT_PANE_TITLE}|${BUILD_STATUS_VALUE}|${CONTEXT_STATUS_VALUE}|${PERCENT}"
-  SIG_FILE="/tmp/dev-tmux-title/${WORKSPACE_NAME}-cmux-sig"
-  mkdir -p /tmp/dev-tmux-title 2>/dev/null
+# Unchanged state re-pushes after STATE_TTL so titles/cmux self-heal after a terminal restart.
+STATE_MIN_INTERVAL=30
+STATE_TTL=60
+STATE_SIG="${WORKSPACE_TITLE}|${AGENT_PANE_TITLE}|${BUILD_PANE_TITLE}|${BUILD_STATUS_VALUE}|${CONTEXT_STATUS_VALUE}|${PERCENT}"
+SIG_FILE="/tmp/dev-tmux-title/${WORKSPACE_NAME}-state-sig"
+mkdir -p /tmp/dev-tmux-title 2>/dev/null
 
-  CMUX_CACHED=""
-  [ -f "$SIG_FILE" ] && CMUX_CACHED="$(cat "$SIG_FILE" 2>/dev/null)"
-  CMUX_MTIME="$(stat -f %m "$SIG_FILE" 2>/dev/null || echo 0)"
-  CMUX_NOW="$(date +%s)"
-  CMUX_ELAPSED=$(( CMUX_NOW - CMUX_MTIME ))
+STATE_CACHED=""
+[ -f "$SIG_FILE" ] && STATE_CACHED="$(cat "$SIG_FILE" 2>/dev/null)"
+STATE_MTIME="$(stat -f %m "$SIG_FILE" 2>/dev/null || echo 0)"
+STATE_ELAPSED=$(( $(date +%s) - STATE_MTIME ))
 
-  CMUX_PUSH=false
-  if [ "$CMUX_CACHED" != "$CMUX_SIG" ]; then
-    # Changed - push, but no more often than once per CMUX_MIN_INTERVAL per workspace.
-    [ "$CMUX_ELAPSED" -ge "$CMUX_MIN_INTERVAL" ] && CMUX_PUSH=true
-  else
-    # Unchanged - re-push only after the TTL so cmux state self-heals after a restart.
-    [ "$CMUX_ELAPSED" -ge "$CMUX_TTL" ] && CMUX_PUSH=true
-  fi
+STATE_PUSH=false
+if [ "$STATE_CACHED" != "$STATE_SIG" ]; then
+  # Changed - push, but no more often than once per STATE_MIN_INTERVAL per workspace.
+  [ "$STATE_ELAPSED" -ge "$STATE_MIN_INTERVAL" ] && STATE_PUSH=true
+else
+  # Unchanged - re-push only after the TTL so titles/cmux self-heal after a restart.
+  [ "$STATE_ELAPSED" -ge "$STATE_TTL" ] && STATE_PUSH=true
+fi
 
-  if [ "$CMUX_PUSH" = true ]; then
+if [ "$STATE_PUSH" = true ]; then
+  # Pane + window titles (the window title also drives the Ghostty tab title off cmux).
+  tmux select-pane -t "$SESSION:.1" -T "$BUILD_PANE_TITLE" 2>/dev/null
+  tmux select-pane -t "$SESSION:.0" -T "$AGENT_PANE_TITLE" 2>/dev/null
+  tmux set-option -t "$SESSION" -q set-titles-string "$WORKSPACE_TITLE" 2>/dev/null
+
+  # Mirror the same state into cmux when available.
+  if cmux_available; then
     cmux_run rename-workspace "$WORKSPACE_TITLE" || true
 
     cmux_run set-status agent "${AGENT_PANE_TITLE#${AGENT_ICON} }" --icon sparkle --color "#34c759" || true
@@ -196,7 +200,7 @@ if cmux_available; then
     else
       cmux_run clear-progress || true
     fi
-
-    printf '%s' "$CMUX_SIG" > "$SIG_FILE" 2>/dev/null || true
   fi
+
+  printf '%s' "$STATE_SIG" > "$SIG_FILE" 2>/dev/null || true
 fi
