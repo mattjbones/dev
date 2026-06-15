@@ -156,7 +156,11 @@ WORKSPACE_TITLE="$(printf '%s' "$WORKSPACE_TITLE" | sed 's/^ *//;s/  */ /g')"
 #      active agent's captured status line ("Thinking", ticking tokens) changes every poll,
 #      so without this the signature differs every cycle and guard 1 never fires.
 # Unchanged state re-pushes after STATE_TTL so titles/cmux self-heal after a terminal restart.
-STATE_MIN_INTERVAL=30
+# Spread each workspace's push window (30-44s) so the ~dozen sessions don't all push on the
+# same wall-clock tick, which otherwise produced a synchronized cmux spike. The offset is
+# derived from the workspace name, so it's stable across polls but differs per workspace.
+STATE_JITTER=$(( $(printf '%s' "$WORKSPACE_NAME" | cksum | cut -d' ' -f1) % 15 ))
+STATE_MIN_INTERVAL=$(( 30 + STATE_JITTER ))
 STATE_TTL=60
 STATE_SIG="${WORKSPACE_TITLE}|${AGENT_PANE_TITLE}|${BUILD_PANE_TITLE}|${BUILD_STATUS_VALUE}|${CONTEXT_STATUS_VALUE}|${PERCENT}"
 SIG_FILE="/tmp/dev-tmux-title/${WORKSPACE_NAME}-state-sig"
