@@ -383,8 +383,10 @@ TITLE_SCRIPT="$SCRIPT_DIR/dev-tmux-title.sh"
 tmux set-option -t "$SESSION" set-titles on
 tmux set-option -t "$SESSION" set-titles-string "$AGENT_ICON $WORKSPACE_NAME"
 
-# Poll every 5 seconds to update title based on running processes and collector output
-tmux set-option -t "$SESSION" status-interval 5
+# Poll every 15 seconds to update title based on running processes and collector output.
+# The title script de-dupes cmux pushes, so a longer interval mainly affects how fast
+# server/storybook icon changes show up - 15s is plenty for that.
+tmux set-option -t "$SESSION" status-interval 15
 tmux set-option -t "$SESSION" status-right "#(${TITLE_SCRIPT} \"$SESSION\" \"$WORKSPACE_NAME\" \"$WORKTREE\" \"$MODEL\" \"$AGENT_ICON\" \"$AGENT_LABEL\")  %H:%M"
 
 # Focus the agent pane

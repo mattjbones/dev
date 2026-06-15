@@ -108,14 +108,12 @@ elif [ -n "$SERVER_ICON" ]; then
     BUILD_STATUS_VALUE="server"
   fi
 fi
-tmux select-pane -t "$SESSION:.1" -T "$BUILD_PANE_TITLE" 2>/dev/null
 
 # --- Update agent pane title with context percentage ---
 AGENT_PANE_TITLE="${AGENT_ICON} ${AGENT_LABEL:-agent}"
 if [ -n "$TOKEN_INFO" ]; then
   AGENT_PANE_TITLE="${AGENT_PANE_TITLE} ·${TOKEN_INFO}"
 fi
-tmux select-pane -t "$SESSION:.0" -T "$AGENT_PANE_TITLE" 2>/dev/null
 
 # --- Claude activity status from pane capture ---
 CLAUDE_STATUS=""
@@ -147,24 +145,66 @@ fi
 WORKSPACE_TITLE="${SERVER_ICON} ${AGENT_ICON} ${WORKSPACE_NAME}${CLAUDE_STATUS}${TOKEN_INFO}"
 WORKSPACE_TITLE="$(printf '%s' "$WORKSPACE_TITLE" | sed 's/^ *//;s/  */ /g')"
 
-tmux set-option -t "$SESSION" -q set-titles-string "$WORKSPACE_TITLE" 2>/dev/null
+# --- Push state to the terminal titles and cmux, change-detected + rate-limited ---
+# Updating the window title (set-titles-string) every poll is the single biggest cost here:
+# each OSC title escape makes the host terminal - cmux especially - do heavy work, so one
+# session per worktree refreshing every cycle pegged the cmux daemon. The cmux_run pushes
+# spawn a CLI process each and spike the daemon too. Both sinks share the same volatile
+# inputs, so gate them together:
+#   1. Skip entirely when nothing changed since the last push (idle sessions go quiet).
+#   2. Rate-limit: even when state changes, push at most once per STATE_MIN_INTERVAL. An
+#      active agent's captured status line ("Thinking", ticking tokens) changes every poll,
+#      so without this the signature differs every cycle and guard 1 never fires.
+# Unchanged state re-pushes after STATE_TTL so titles/cmux self-heal after a terminal restart.
+# Spread each workspace's push window (30-44s) so the ~dozen sessions don't all push on the
+# same wall-clock tick, which otherwise produced a synchronized cmux spike. The offset is
+# derived from the workspace name, so it's stable across polls but differs per workspace.
+STATE_JITTER=$(( $(printf '%s' "$WORKSPACE_NAME" | cksum | cut -d' ' -f1) % 15 ))
+STATE_MIN_INTERVAL=$(( 30 + STATE_JITTER ))
+STATE_TTL=60
+STATE_SIG="${WORKSPACE_TITLE}|${AGENT_PANE_TITLE}|${BUILD_PANE_TITLE}|${BUILD_STATUS_VALUE}|${CONTEXT_STATUS_VALUE}|${PERCENT}"
+SIG_FILE="/tmp/dev-tmux-title/${WORKSPACE_NAME}-state-sig"
+mkdir -p /tmp/dev-tmux-title 2>/dev/null
 
-# --- Mirror the same state into CMUX when available ---
-if cmux_available; then
-  cmux_run rename-workspace "$WORKSPACE_TITLE" || true
+STATE_CACHED=""
+[ -f "$SIG_FILE" ] && STATE_CACHED="$(cat "$SIG_FILE" 2>/dev/null)"
+STATE_MTIME="$(stat -f %m "$SIG_FILE" 2>/dev/null || echo 0)"
+STATE_ELAPSED=$(( $(date +%s) - STATE_MTIME ))
 
-  cmux_run set-status agent "${AGENT_PANE_TITLE#${AGENT_ICON} }" --icon sparkle --color "#34c759" || true
-  cmux_run set-status build "$BUILD_STATUS_VALUE" --icon shippingbox --color "#0a84ff" || true
+STATE_PUSH=false
+if [ "$STATE_CACHED" != "$STATE_SIG" ]; then
+  # Changed - push, but no more often than once per STATE_MIN_INTERVAL per workspace.
+  [ "$STATE_ELAPSED" -ge "$STATE_MIN_INTERVAL" ] && STATE_PUSH=true
+else
+  # Unchanged - re-push only after the TTL so titles/cmux self-heal after a restart.
+  [ "$STATE_ELAPSED" -ge "$STATE_TTL" ] && STATE_PUSH=true
+fi
 
-  if [ -n "$CONTEXT_STATUS_VALUE" ]; then
-    cmux_run set-status context "$CONTEXT_STATUS_VALUE" --icon gauge --color "#ff9f0a" || true
-  else
-    cmux_run clear-status context || true
+if [ "$STATE_PUSH" = true ]; then
+  # Pane + window titles (the window title also drives the Ghostty tab title off cmux).
+  tmux select-pane -t "$SESSION:.1" -T "$BUILD_PANE_TITLE" 2>/dev/null
+  tmux select-pane -t "$SESSION:.0" -T "$AGENT_PANE_TITLE" 2>/dev/null
+  tmux set-option -t "$SESSION" -q set-titles-string "$WORKSPACE_TITLE" 2>/dev/null
+
+  # Mirror the same state into cmux when available.
+  if cmux_available; then
+    cmux_run rename-workspace "$WORKSPACE_TITLE" || true
+
+    cmux_run set-status agent "${AGENT_PANE_TITLE#${AGENT_ICON} }" --icon sparkle --color "#34c759" || true
+    cmux_run set-status build "$BUILD_STATUS_VALUE" --icon shippingbox --color "#0a84ff" || true
+
+    if [ -n "$CONTEXT_STATUS_VALUE" ]; then
+      cmux_run set-status context "$CONTEXT_STATUS_VALUE" --icon gauge --color "#ff9f0a" || true
+    else
+      cmux_run clear-status context || true
+    fi
+
+    if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]]; then
+      cmux_run set-progress "$(awk "BEGIN { printf \"%.2f\", $PERCENT / 100 }")" --label "${PERCENT}%" || true
+    else
+      cmux_run clear-progress || true
+    fi
   fi
 
-  if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]]; then
-    cmux_run set-progress "$(awk "BEGIN { printf \"%.2f\", $PERCENT / 100 }")" --label "${PERCENT}%" || true
-  else
-    cmux_run clear-progress || true
-  fi
+  printf '%s' "$STATE_SIG" > "$SIG_FILE" 2>/dev/null || true
 fi
