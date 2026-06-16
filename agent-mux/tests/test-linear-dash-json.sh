@@ -10,6 +10,7 @@ assert_eq "$(printf '%s' "$out" | jq 'type')" '"array"' "is array"
 assert_eq "$(printf '%s' "$out" | jq 'length')" "2" "two entries"
 assert_eq "$(printf '%s' "$out" | jq -r '.[0].branch')" "eng-7443" "branch echoed"
 assert_eq "$(printf '%s' "$out" | jq -r '.[0].ticket')" "ENG-7443" "ticket derived"
+# 'appointment-moving' yields no ticket: 'appointment' (11 chars) exceeds the {2,7} team-key bound.
 assert_eq "$(printf '%s' "$out" | jq -r '.[1].ticket')" "null" "ad-hoc has no ticket"
 assert_eq "$(printf '%s' "$out" | jq 'all(.[]; has("priority") and has("pr"))' )" "true" "fields present"
 finish

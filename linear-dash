@@ -660,8 +660,14 @@ async function emitBoardJson(branches) {
       const { stdout } = await execFileP('gh', ['pr', 'view', branch, '--repo', ARGS.repo, '--json', PR_JSON_FIELDS]);
       const p = JSON.parse(stdout);
       pr = { number: p.number, state: p.state, isDraft: p.isDraft, reviewDecision: p.reviewDecision, mergeStateStatus: p.mergeStateStatus };
-    } catch {
+    } catch (err) {
       pr = null;
+      // "no PR for this branch" is the normal case (gh exits non-zero); only warn on
+      // anything that doesn't look like that, so auth/network failures stay visible.
+      const stderr = String(err?.stderr ?? '');
+      if (stderr && !/no (open )?pull requests? found/i.test(stderr)) {
+        process.stderr.write(`linear-dash --json: gh pr view ${branch} failed: ${stderr.trim().split('\n')[0]}\n`);
+      }
     }
     out.push({
       branch,
@@ -673,7 +679,7 @@ async function emitBoardJson(branches) {
       pr,
     });
   }
-  process.stdout.write(JSON.stringify(out));
+  process.stdout.write(JSON.stringify(out) + '\n');
 }
 
 // ---------- details page data (lazy, on Enter) ----------
