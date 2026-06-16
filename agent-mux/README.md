@@ -63,6 +63,18 @@ Inside the session — prefix is **Ctrl-a** (Ctrl-b is captured by Claude Code):
 The Ghostty tab title and status line update every 5s with server status and
 agent context usage (`dev-tmux-title.sh` + `dev-tmux-collect.sh`).
 
+## `dev board` — urgency view
+
+Ranks all workspaces by Linear priority × needs-my-action into four tiers
+(🔴 Act Now / 🟠 Needs You / 🟢 In Progress / ⚪ Parked) and opens an fzf picker;
+`enter` attaches to the selected workspace. Priority comes from Linear (via
+`linear-dash --json`), review state from open PRs / Linear "In Review", and the
+agent's attention (blocked / working / idle) from its pane. The cmux sidebar is
+reordered under four pinned header workspaces, and the tmux title line shows a
+tier badge. Data is cached in `/tmp/dev-board/cache.json` (TTL 180s), refreshed
+on attach and on `dev board`; there is no background daemon. `dev board --refresh`
+forces a refetch.
+
 ## Workspace management — `dev ctl`
 
 Interactive fzf command centre over all workspaces (also `dev-ctl list`,
