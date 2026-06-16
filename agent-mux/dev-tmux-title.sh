@@ -213,16 +213,20 @@ fi
 # Any session may trigger it, but an atomic mkdir lock + a timestamp keep it to once
 # per DEV_BOARD_REFLECT_INTERVAL across all sessions. The reflect runs in the background
 # so it never delays the status line.
-BOARD_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-REFLECT_INTERVAL="${DEV_BOARD_REFLECT_INTERVAL:-300}"
-REFLECT_STAMP="/tmp/dev-board/last-reflect"
-REFLECT_LOCK="/tmp/dev-board/reflect.lock"
-mkdir -p /tmp/dev-board 2>/dev/null || true
-REFLECT_NOW="$(date +%s)"
-REFLECT_M="$(stat -f %m "$REFLECT_STAMP" 2>/dev/null || echo 0)"
-if [ "$(( REFLECT_NOW - REFLECT_M ))" -ge "$REFLECT_INTERVAL" ]; then
-  if mkdir "$REFLECT_LOCK" 2>/dev/null; then
-    touch "$REFLECT_STAMP" 2>/dev/null || true
-    ( "$BOARD_DIR/dev-board.sh" --reflect >/dev/null 2>&1; rmdir "$REFLECT_LOCK" 2>/dev/null || true ) &
+# The sidebar re-sort only matters under cmux; skip the work entirely otherwise.
+__CMUX_BIN="$(command -v cmux 2>/dev/null || echo /Applications/cmux.app/Contents/Resources/bin/cmux)"
+if [ -x "$__CMUX_BIN" ]; then
+  BOARD_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+  REFLECT_INTERVAL="${DEV_BOARD_REFLECT_INTERVAL:-300}"
+  REFLECT_STAMP="/tmp/dev-board/last-reflect"
+  REFLECT_LOCK="/tmp/dev-board/reflect.lock"
+  mkdir -p /tmp/dev-board 2>/dev/null || true
+  REFLECT_NOW="$(date +%s)"
+  REFLECT_M="$(stat -f %m "$REFLECT_STAMP" 2>/dev/null || echo 0)"
+  if [ "$(( REFLECT_NOW - REFLECT_M ))" -ge "$REFLECT_INTERVAL" ]; then
+    if mkdir "$REFLECT_LOCK" 2>/dev/null; then
+      touch "$REFLECT_STAMP" 2>/dev/null || true
+      ( "$BOARD_DIR/dev-board.sh" --reflect >/dev/null 2>&1; rmdir "$REFLECT_LOCK" 2>/dev/null || true ) &
+    fi
   fi
 fi

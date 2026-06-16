@@ -65,15 +65,30 @@ agent context usage (`dev-tmux-title.sh` + `dev-tmux-collect.sh`).
 
 ## `dev board` — urgency view
 
-Ranks all workspaces by Linear priority × needs-my-action into four tiers
-(🔴 Act Now / 🟠 Needs You / 🟢 In Progress / ⚪ Parked) and opens an fzf picker;
-`enter` attaches to the selected workspace. Priority comes from Linear (via
-`linear-dash --json`), review state from open PRs / Linear "In Review", and the
-agent's attention (blocked / working / idle) from its pane. The cmux sidebar is
-reordered under four pinned header workspaces, and the tmux title line shows a
-tier badge. Data is cached in `/tmp/dev-board/cache.json` (TTL 180s), refreshed
-on attach and on `dev board`; there is no background daemon. `dev board --refresh`
-forces a refetch.
+`dev board` opens an fzf picker of all your active workspaces ranked by urgency;
+`enter` attaches to the selected one. It works in any terminal.
+
+Five tiers, most urgent first:
+
+| Tier | Meaning |
+| --- | --- |
+| 🔴 Act Now | High-priority Linear ticket that also needs action (open PR or agent blocked) |
+| 🔵 Waiting for Review | Idle with an open (non-draft) PR, or Linear status "In Review" |
+| 🟠 Needs You | Agent blocked, waiting on your input |
+| 🟢 In Progress | Agent actively working, or Medium+ priority work sitting idle |
+| ⚪ Parked | Low/None priority, idle |
+
+Signals: **priority** comes from the workspace's Linear ticket — taken from the
+workspace name, falling back to the live git branch; **review state** from the
+live branch's PR (via `gh`) or Linear "In Review"; **attention**
+(working/blocked/idle) from the agent pane. An actively-working agent counts as
+In Progress even if it has an open PR.
+
+Under **cmux**, the sidebar is also reorganised into five pinned header
+workspaces matching the tiers — re-sorted on `dev board`, on attach, and every
+~5 minutes (local-only; no extra network). Outside cmux the sidebar reflection
+is skipped; the picker still works everywhere. Data is cached in
+`/tmp/dev-board/cache.json` (TTL 180s); `dev board --refresh` forces a refetch.
 
 ## Workspace management — `dev ctl`
 
