@@ -1,0 +1,7 @@
+[
+  {"key":"low-idle","ticket":"ENG-1","priority":4,"needsReview":false,"attention":"idle","lastFocus":10},
+  {"key":"high-review","ticket":"ENG-2","priority":2,"needsReview":true,"attention":"working","lastFocus":20},
+  {"key":"med-blocked","ticket":"ENG-3","priority":3,"needsReview":false,"attention":"blocked","lastFocus":30},
+  {"key":"urgent-blocked","ticket":"ENG-4","priority":1,"needsReview":false,"attention":"blocked","lastFocus":5},
+  {"key":"working","ticket":"ENG-5","priority":3,"needsReview":false,"attention":"working","lastFocus":40}
+]
