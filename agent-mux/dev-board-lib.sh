@@ -21,25 +21,19 @@ priority_rank() {
 }
 
 # tier_for <priority 0..4> <reviewState merge|review|none> <attention blocked|working|idle> -> 1..6
-# Precedence: blocked > working > ready-to-merge > in-review > medium+ idle > low/none idle.
-# High priority promotes a needs-action item to Act Now. Working always = In Progress.
+# Act Now is reserved for Linear Urgent (priority 1) — always top, regardless of state.
+# Otherwise: blocked > working > ready-to-merge > in-review > medium+ idle > low/none idle.
 # 1 Act Now  2 Ready to Merge  3 Waiting for Review  4 Needs You  5 In Progress  6 Parked
 tier_for() {
   local priority="${1:?}" review="${2:?}" attention="${3:?}"
-  local high=0 low=0
-  { [ "$priority" = "1" ] || [ "$priority" = "2" ]; } && high=1
+  local low=0
   { [ "$priority" = "0" ] || [ "$priority" = "4" ]; } && low=1
-  if [ "$attention" = "blocked" ]; then
-    if [ "$high" = "1" ]; then echo 1; else echo 4; fi
-  elif [ "$attention" = "working" ]; then
-    echo 5
-  elif [ "$review" = "merge" ]; then
-    if [ "$high" = "1" ]; then echo 1; else echo 2; fi
-  elif [ "$review" = "review" ]; then
-    if [ "$high" = "1" ]; then echo 1; else echo 3; fi
-  elif [ "$low" = "0" ]; then
-    echo 5
-  else
-    echo 6
+  if [ "$priority" = "1" ]; then echo 1
+  elif [ "$attention" = "blocked" ]; then echo 4
+  elif [ "$attention" = "working" ]; then echo 5
+  elif [ "$review" = "merge" ]; then echo 2
+  elif [ "$review" = "review" ]; then echo 3
+  elif [ "$low" = "0" ]; then echo 5
+  else echo 6
   fi
 }
