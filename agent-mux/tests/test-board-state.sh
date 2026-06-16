@@ -8,4 +8,6 @@ source "$DIR/../dev-board-state.sh"
 assert_eq "$(attention_from_pane 'esc to interrupt · ✳ Thinking (40s)')" "working" "thinking = working"
 assert_eq "$(attention_from_pane 'Do you want to proceed? 1. Yes 2. No')"  "blocked" "prompt = blocked"
 assert_eq "$(attention_from_pane '$ ')"                                    "idle"    "shell = idle"
+# A missing session must yield 0 (not empty), so downstream numeric handling is safe.
+assert_eq "$(last_focus_for_session this-session-does-not-exist-xyz)" "0" "missing session lastFocus = 0"
 finish

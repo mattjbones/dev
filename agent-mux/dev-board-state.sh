@@ -20,7 +20,10 @@ attention_for_session() {
   attention_from_pane "$text"
 }
 
-# last_focus_for_session <session> -> epoch seconds of last activity (0 if unknown)
+# last_focus_for_session <session> -> epoch seconds of last activity (0 if unknown).
+# tmux can exit 0 with empty output for a missing session, so guard on empty too.
 last_focus_for_session() {
-  tmux display-message -p -t "$1" '#{session_activity}' 2>/dev/null || echo 0
+  local ts
+  ts="$(tmux display-message -p -t "$1" '#{session_activity}' 2>/dev/null)"
+  if [ -n "$ts" ]; then echo "$ts"; else echo 0; fi
 }
