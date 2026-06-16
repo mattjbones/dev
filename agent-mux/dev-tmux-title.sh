@@ -145,17 +145,28 @@ fi
 WORKSPACE_TITLE="${SERVER_ICON} ${AGENT_ICON} ${WORKSPACE_NAME}${CLAUDE_STATUS}${TOKEN_INFO}"
 WORKSPACE_TITLE="$(printf '%s' "$WORKSPACE_TITLE" | sed 's/^ *//;s/  */ /g')"
 
-# Urgency badge from the board cache (local file, no network). Folds into WORKSPACE_TITLE
-# (and therefore STATE_SIG) so it adds no extra cmux pushes.
+# Urgency badge: derive the tier locally from cached priority/needsReview (no network)
+# plus the agent's live attention from the pane we already captured. Folds into
+# WORKSPACE_TITLE (and thus STATE_SIG) so it adds no extra cmux pushes.
 BOARD_CACHE="${DEV_BOARD_CACHE:-/tmp/dev-board/cache.json}"
 if [ -f "$BOARD_CACHE" ]; then
-  BOARD_TIER="$(jq -r --arg k "$SESSION" '.workspaces[]? | select(.key==$k) | .tier // empty' "$BOARD_CACHE" 2>/dev/null | head -1)"
-  case "$BOARD_TIER" in
-    1) WORKSPACE_TITLE="🔴 ${WORKSPACE_TITLE}" ;;
-    2) WORKSPACE_TITLE="🟠 ${WORKSPACE_TITLE}" ;;
-    3) WORKSPACE_TITLE="🟢 ${WORKSPACE_TITLE}" ;;
-    4) WORKSPACE_TITLE="⚪ ${WORKSPACE_TITLE}" ;;
-  esac
+  BOARD_LIB_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+  # shellcheck disable=SC1090
+  . "$BOARD_LIB_DIR/dev-board-lib.sh" 2>/dev/null || true
+  . "$BOARD_LIB_DIR/dev-board-state.sh" 2>/dev/null || true
+  BOARD_PRIO="$(jq -r --arg k "$SESSION" '.workspaces[]? | select(.key==$k) | .priority // 0' "$BOARD_CACHE" 2>/dev/null | head -1)"
+  BOARD_NR="$(jq -r --arg k "$SESSION" '.workspaces[]? | select(.key==$k) | (if .needsReview then 1 else 0 end)' "$BOARD_CACHE" 2>/dev/null | head -1)"
+  if [ -n "$BOARD_PRIO" ] && command -v tier_for >/dev/null 2>&1; then
+    BOARD_ATT="$(attention_from_pane "$PANE_CONTENT")"
+    BOARD_TIER="$(tier_for "${BOARD_PRIO:-0}" "${BOARD_NR:-0}" "$BOARD_ATT" 2>/dev/null || echo "")"
+    case "$BOARD_TIER" in
+      1) WORKSPACE_TITLE="🔴 ${WORKSPACE_TITLE}" ;;
+      2) WORKSPACE_TITLE="🔵 ${WORKSPACE_TITLE}" ;;
+      3) WORKSPACE_TITLE="🟠 ${WORKSPACE_TITLE}" ;;
+      4) WORKSPACE_TITLE="🟢 ${WORKSPACE_TITLE}" ;;
+      5) WORKSPACE_TITLE="⚪ ${WORKSPACE_TITLE}" ;;
+    esac
+  fi
 fi
 
 # --- Push state to the terminal titles and cmux, change-detected + rate-limited ---
@@ -220,4 +231,22 @@ if [ "$STATE_PUSH" = true ]; then
   fi
 
   printf '%s' "$STATE_SIG" > "$SIG_FILE" 2>/dev/null || true
+fi
+
+# --- Periodic sidebar re-sort (local-only, no network) ---
+# Any session may trigger it, but an atomic mkdir lock + a timestamp keep it to once
+# per DEV_BOARD_REFLECT_INTERVAL across all sessions. The reflect runs in the background
+# so it never delays the status line.
+BOARD_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+REFLECT_INTERVAL="${DEV_BOARD_REFLECT_INTERVAL:-300}"
+REFLECT_STAMP="/tmp/dev-board/last-reflect"
+REFLECT_LOCK="/tmp/dev-board/reflect.lock"
+mkdir -p /tmp/dev-board 2>/dev/null || true
+REFLECT_NOW="$(date +%s)"
+REFLECT_M="$(stat -f %m "$REFLECT_STAMP" 2>/dev/null || echo 0)"
+if [ "$(( REFLECT_NOW - REFLECT_M ))" -ge "$REFLECT_INTERVAL" ]; then
+  if mkdir "$REFLECT_LOCK" 2>/dev/null; then
+    touch "$REFLECT_STAMP" 2>/dev/null || true
+    ( "$BOARD_DIR/dev-board.sh" --reflect >/dev/null 2>&1; rmdir "$REFLECT_LOCK" 2>/dev/null || true ) &
+  fi
 fi
