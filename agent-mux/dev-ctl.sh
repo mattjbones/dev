@@ -636,6 +636,14 @@ action_stop() {
     pkill -P "$build_pid" 2>/dev/null || true
   fi
 
+  # Refresh the title now so the docker/server icon clears immediately instead of waiting
+  # for the next ~15-30s status poll. Removing the sig cache bypasses dev-tmux-title.sh's
+  # change-detection rate-limit, forcing an immediate cmux/Ghostty title push.
+  if tmux has-session -t "$session" 2>/dev/null; then
+    rm -f "/tmp/dev-tmux-title/${session}-state-sig" 2>/dev/null || true
+    "$SCRIPT_DIR/dev-tmux-title.sh" "$session" "$session" "${worktree:-$HOME/workspace/$session}" >/dev/null 2>&1 &
+  fi
+
   echo "Stopped services for '$session'"
 }
 
