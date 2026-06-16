@@ -9,9 +9,12 @@ input="$(cat)"
 count="$(printf '%s' "$input" | jq 'length')"
 
 # Compute tier per record in bash (uses tier_for), collect tiers as a JSON array.
+# Empty input: emit an empty array directly (avoids macOS `seq 0 -1` running a
+# bogus i=0/-1 iteration).
+[ "$count" -eq 0 ] && { printf '[]'; exit 0; }
+
 tiers="[]"
 for i in $(seq 0 $((count - 1))); do
-  [ "$count" -eq 0 ] && break
   rec="$(printf '%s' "$input" | jq ".[$i]")"
   priority="$(printf '%s' "$rec" | jq -r '.priority // 0')"
   needs_review="$(printf '%s' "$rec" | jq -r 'if .needsReview then 1 else 0 end')"
@@ -22,8 +25,9 @@ done
 
 # Merge tiers back, then sort: tier asc, priorityRank desc, lastFocus desc.
 printf '%s' "$input" | jq --argjson tiers "$tiers" '
+  # prank mirrors priority_rank() in dev-board-lib.sh — keep the two in sync.
   def prank: {"1":4,"2":3,"3":2,"4":1} as $m | ($m[(.priority|tostring)] // 0);
   to_entries
   | map(.value + {tier: $tiers[.key]})
-  | sort_by([.tier, -(.|prank), -(.lastFocus // 0)])
+  | sort_by([.tier, -(.|prank), -((.lastFocus // 0) | if type=="number" then . else 0 end)])
 '
