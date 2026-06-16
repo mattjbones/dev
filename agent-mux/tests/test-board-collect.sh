@@ -20,6 +20,7 @@ export DEV_BOARD_CACHE="$STUB/cache.json"
 WL='[{"key":"eng-7443","branch":"eng-7443","worktree":"/tmp/eng-7443"}]'
 echo "$WL" | "$DIR/../dev-board-collect.sh" --stdin --refresh >/dev/null
 assert_eq "$(jq -r '.workspaces[0].needsReview' "$DEV_BOARD_CACHE")" "true" "needsReview from PR"
+assert_eq "$(jq -r '.workspaces[0].reviewState' "$DEV_BOARD_CACHE")" "review" "reviewState from open PR (not approved)"
 assert_eq "$(jq -r '.workspaces[0].priority' "$DEV_BOARD_CACHE")" "2" "priority merged"
 calls1="$(wc -l < "$STUB_LOG" | tr -d ' ')"
 

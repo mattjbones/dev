@@ -17,9 +17,9 @@ tiers="[]"
 for i in $(seq 0 $((count - 1))); do
   rec="$(printf '%s' "$input" | jq ".[$i]")"
   priority="$(printf '%s' "$rec" | jq -r '.priority // 0')"
-  needs_review="$(printf '%s' "$rec" | jq -r 'if .needsReview then 1 else 0 end')"
+  review="$(printf '%s' "$rec" | jq -r '.reviewState // "none"')"
   attention="$(printf '%s' "$rec" | jq -r '.attention // "idle"')"
-  t="$(tier_for "$priority" "$needs_review" "$attention")"
+  t="$(tier_for "$priority" "$review" "$attention")"
   tiers="$(printf '%s' "$tiers" | jq ". + [$t]")"
 done
 

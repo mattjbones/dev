@@ -87,6 +87,16 @@ MERGED="$(printf '%s' "$WL2" | jq --argjson snap "$SNAP" '
           linearState: ($s.linearState // null),
           linearStateType: ($s.linearStateType // null),
           pr: ($s.pr // null),
+          reviewState: (
+            if (($s.pr.state // "") == "OPEN" and ($s.pr.isDraft // false) == false
+                and ($s.pr.reviewDecision // "") == "APPROVED"
+                and ($s.pr.mergeStateStatus // "") == "CLEAN")
+            then "merge"
+            elif (($s.pr.state // "") == "OPEN" and ($s.pr.isDraft // false) == false)
+                 or (($s.linearState // "") | test("review"; "i"))
+            then "review"
+            else "none" end
+          ),
           needsReview: (
             (($s.pr.state // "") == "OPEN" and ($s.pr.isDraft // false) == false)
             or (($s.linearState // "") | test("review"; "i"))

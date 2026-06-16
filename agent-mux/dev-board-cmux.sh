@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Reflect a ranked workspace list (JSON on stdin: [{key,tier}]) into cmux:
-# ensure 5 header workspaces (unpinned), then order the full sequence
+# ensure 6 header workspaces (unpinned), then order the full sequence
 # (headers + real workspaces interleaved) via move-top + reorder-workspace.
 set -euo pipefail
 
@@ -11,10 +11,11 @@ CMUX_BIN="${CMUX_BIN:-$(command -v cmux 2>/dev/null || echo /Applications/cmux.a
 header_def() {
   case "$1" in
     1) echo "🔴 Act Now|Red" ;;
-    2) echo "🔵 Waiting for Review|Blue" ;;
-    3) echo "🟠 Needs You|Amber" ;;
-    4) echo "🟢 In Progress|Green" ;;
-    5) echo "⚪ Parked|Charcoal" ;;
+    2) echo "🟢 Ready to Merge|Green" ;;
+    3) echo "🔵 Waiting for Review|Blue" ;;
+    4) echo "🟠 Needs You|Orange" ;;
+    5) echo "🟡 In Progress|Amber" ;;
+    6) echo "⚪ Parked|Charcoal" ;;
   esac
 }
 
@@ -33,7 +34,7 @@ header_ref_get() { eval "printf '%s' \"\${HEADER_REF_${1}:-}\""; }
 # Ensure each header exists + is unpinned + colored. Populate HEADER_REF_N vars.
 ensure_headers() {
   local tier def title color ref
-  for tier in 1 2 3 4 5; do
+  for tier in 1 2 3 4 5 6; do
     def="$(header_def "$tier")"; title="${def%%|*}"; color="${def##*|}"
     ref="$(ref_for_title "$title")"
     if [ -z "$ref" ]; then
@@ -67,7 +68,7 @@ main() {
 
   # Build the desired ordered ref sequence: header(tier) then that tier's workspaces.
   local seq="" t href i key wref
-  for t in 1 2 3 4 5; do
+  for t in 1 2 3 4 5 6; do
     href="$(header_ref_get "$t")"
     [ -n "$href" ] && seq="$seq $href"
     if [ "$n" -gt 0 ]; then
