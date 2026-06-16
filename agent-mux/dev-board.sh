@@ -8,8 +8,6 @@ source "$DIR/dev-board-state.sh"
 TIER_GLYPH() { case "$1" in 1) echo 🔴;; 2) echo 🟠;; 3) echo 🟢;; *) echo ⚪;; esac; }
 
 # board_render_lines <focus-epoch>  (ranked JSON on stdin) -> tab-separated rows: key<TAB>display
-# Note: appends a trailing ' \n' so that wc -l on the captured output counts correctly
-# (command substitution strips trailing newlines; the trailing space prevents that).
 board_render_lines() {
   local focus="${1:-0}"
   jq -r --argjson focus "$focus" '
@@ -19,7 +17,6 @@ board_render_lines() {
         local mark=""; [ "$here" = "1" ] && mark="  ← you were here"
         printf '%s\t%s  %-22s %-7s %-9s %s%s\n' "$key" "$(TIER_GLYPH "$tier")" "$key" "$prio" "$att" "$ticket" "$mark"
       done
-  printf ' \n'
 }
 
 # Build the merged+ranked records (collect cache -> + local state -> rank).
@@ -47,8 +44,6 @@ board_pick() {
   sel="$(printf '%s' "$ranked" | board_render_lines "$focus" \
         | fzf --ansi --with-nth=2.. --delimiter='\t' --prompt='board> ' \
         | cut -f1)"
-  # Strip any whitespace (the trailing sentinel line ' \n' can produce a space key).
-  sel="${sel// /}"
   [ -n "$sel" ] && exec "$DIR/dev.sh" "$sel"
 }
 
