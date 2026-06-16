@@ -9,6 +9,9 @@ assert_eq "$(parse_linear_id eng-7443)"                    "ENG-7443" "plain eng
 assert_eq "$(parse_linear_id eng-7449-matt-print-all-ca95cc)" "ENG-7449" "eng with suffix"
 assert_eq "$(parse_linear_id appointment-moving)"          ""         "no ticket"
 assert_eq "$(parse_linear_id QA-12)"                       "QA-12"    "other team"
+assert_eq "$(parse_linear_id ca95cc)"        "" "git hash suffix not a ticket"
+assert_eq "$(parse_linear_id fix-bug-2024)"  "" "no-ticket branch with trailing number"
+assert_eq "$(parse_linear_id matt/eng-7449-print-all)" "ENG-7449" "linear-style branch with slash"
 
 # priority_rank: Urgent=4 High=3 Medium=2 Low=1 None=0
 assert_eq "$(priority_rank 1)" "4" "urgent"

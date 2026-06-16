@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Pure functions for the dev urgency board. No I/O; safe to source and unit-test.
 
-# parse_linear_id <name> -> "ENG-7443" or "" (first TEAM-NNNN-ish token)
+# parse_linear_id <name> -> "ENG-7443" or "" (first TEAM-NNNN token; hyphen required)
 parse_linear_id() {
   local name="$1"
-  if [[ "$name" =~ ([A-Za-z]{2,7})-?([0-9]{2,6}) ]]; then
-    printf '%s-%s' "$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:lower:]' '[:upper:]')" "${BASH_REMATCH[2]}"
+  if [[ "$name" =~ (^|[^A-Za-z0-9-])([A-Za-z]{2,7})-([0-9]{2,6}) ]]; then
+    printf '%s-%s' "$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:lower:]' '[:upper:]')" "${BASH_REMATCH[3]}"
   fi
 }
 
@@ -22,7 +22,7 @@ priority_rank() {
 
 # tier_for <priority 0..4> <needsReview 0|1> <attention blocked|working|idle> -> 1..4
 tier_for() {
-  local priority="$1" needs_review="$2" attention="$3"
+  local priority="${1:?}" needs_review="${2:?}" attention="${3:?}"
   local high=0 needs_action=0
   { [ "$priority" = "1" ] || [ "$priority" = "2" ]; } && high=1
   { [ "$needs_review" = "1" ] || [ "$attention" = "blocked" ]; } && needs_action=1
