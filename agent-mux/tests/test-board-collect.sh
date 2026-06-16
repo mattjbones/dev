@@ -5,13 +5,15 @@ source "$DIR/board-test-helpers.sh"
 
 # Stub linear-dash on PATH so no network is hit.
 STUB="$(mktemp -d)"
+trap 'rm -rf "$STUB"' EXIT
+export STUB_LOG="$STUB/log"
 cat > "$STUB/linear-dash" <<'EOF'
 #!/usr/bin/env bash
 echo "STUBCALL" >> "$STUB_LOG"
 echo '[{"branch":"eng-7443","ticket":"ENG-7443","priority":2,"priorityLabel":"High","linearState":"In Review","linearStateType":"started","pr":{"number":1,"state":"OPEN","isDraft":false,"reviewDecision":"CHANGES_REQUESTED","mergeStateStatus":"BLOCKED"}}]'
 EOF
 chmod +x "$STUB/linear-dash"
-export PATH="$STUB:$PATH" STUB_LOG="$STUB/log"
+export PATH="$STUB:$PATH"
 export DEV_BOARD_CACHE="$STUB/cache.json"
 
 # Feed an explicit workspace list (avoids tmux/manifest dependency in the test).

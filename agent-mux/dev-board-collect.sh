@@ -15,10 +15,11 @@ for a in "$@"; do
 done
 mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
 
-# TTL gate.
+# TTL gate. If the cache is fresh, print it and stop; if it vanished mid-read,
+# fall through to a fresh fetch rather than dying under `set -e`.
 if [ "$REFRESH" -eq 0 ] && [ -f "$CACHE" ]; then
   age=$(( $(date +%s) - $(stat -f %m "$CACHE" 2>/dev/null || echo 0) ))
-  [ "$age" -lt "$TTL" ] && { cat "$CACHE"; exit 0; }
+  if [ "$age" -lt "$TTL" ] && cat "$CACHE" 2>/dev/null; then exit 0; fi
 fi
 
 # Workspace list: {key,branch,worktree}[]
@@ -30,7 +31,11 @@ else
 fi
 
 branches="$(printf '%s' "$WL" | jq -r '[.[].branch] | join(",")')"
-SNAP="$(linear-dash --json --branches "$branches" 2>/dev/null || echo '[]')"
+if [ -z "$branches" ]; then
+  SNAP='[]'
+else
+  SNAP="$(linear-dash --json --branches "$branches" 2>/dev/null || echo '[]')"
+fi
 
 # Merge snapshot into workspace list by branch; compute needsReview.
 MERGED="$(printf '%s' "$WL" | jq --argjson snap "$SNAP" '
@@ -50,5 +55,9 @@ MERGED="$(printf '%s' "$WL" | jq --argjson snap "$SNAP" '
         })
 ')"
 
-printf '%s' "{\"generatedAt\": $(date +%s), \"workspaces\": $MERGED}" > "$CACHE"
+# Atomic write: a concurrent reader (e.g. the attach-refresh hook racing a manual
+# `dev board`) must never see a half-written cache. Write to a temp file, then rename.
+CACHE_TMP="$(dirname "$CACHE")/.cache.json.tmp.$$"
+printf '%s' "{\"generatedAt\": $(date +%s), \"workspaces\": $MERGED}" > "$CACHE_TMP"
+mv "$CACHE_TMP" "$CACHE"
 cat "$CACHE"
