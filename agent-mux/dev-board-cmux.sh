@@ -27,19 +27,42 @@ ref_for_title() {
   list_ws | awk -v t="$1" 'index($0, t) { print ($1 == "*") ? $2 : $1; exit }'
 }
 
-# Header refs stored as plain variables: HEADER_REF_1 .. HEADER_REF_5
+# header_label <tier> -> the text label without the leading glyph (e.g. "In Progress")
+header_label() {
+  local def title; def="$(header_def "$1")"; title="${def%%|*}"
+  printf '%s' "${title#* }"
+}
+
+# ref_for_label <label> -> ref of an existing header workspace for this label (any glyph), else ""
+ref_for_label() {
+  list_ws | awk -v lbl="$1" '
+    { ref = ($1 == "*") ? $2 : $1
+      start = ($1 == "*") ? 3 : 2
+      title = ""
+      for (j = start; j <= NF; j++) title = title (title == "" ? "" : " ") $j
+      # header rows are "<glyph> <Label>"; match the label as the trailing text
+      if (title ~ ("(^| )" lbl "$")) { print ref; exit }
+    }'
+}
+
+# Header refs stored as plain variables: HEADER_REF_1 .. HEADER_REF_6
 header_ref_set() { eval "HEADER_REF_${1}=${2}"; }
 header_ref_get() { eval "printf '%s' \"\${HEADER_REF_${1}:-}\""; }
 
 # Ensure each header exists + is unpinned + colored. Populate HEADER_REF_N vars.
+# Matches by stable text label so glyph/color changes rename in place (no orphans).
 ensure_headers() {
-  local tier def title color ref
+  local tier def title color label ref
   for tier in 1 2 3 4 5 6; do
     def="$(header_def "$tier")"; title="${def%%|*}"; color="${def##*|}"
-    ref="$(ref_for_title "$title")"
+    label="$(header_label "$tier")"
+    ref="$(ref_for_label "$label")"
     if [ -z "$ref" ]; then
       "$CMUX_BIN" new-workspace --name "$title" >/dev/null 2>&1 || true
-      ref="$(ref_for_title "$title")"
+      ref="$(ref_for_label "$label")"
+    else
+      # heal glyph/color drift in place (no orphaned duplicate)
+      "$CMUX_BIN" workspace-action --workspace "$ref" --action rename --title "$title" >/dev/null 2>&1 || true
     fi
     [ -n "$ref" ] || continue
     "$CMUX_BIN" workspace-action --workspace "$ref" --action unpin >/dev/null 2>&1 || true
