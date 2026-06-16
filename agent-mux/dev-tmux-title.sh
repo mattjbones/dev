@@ -145,30 +145,6 @@ fi
 WORKSPACE_TITLE="${SERVER_ICON} ${AGENT_ICON} ${WORKSPACE_NAME}${CLAUDE_STATUS}${TOKEN_INFO}"
 WORKSPACE_TITLE="$(printf '%s' "$WORKSPACE_TITLE" | sed 's/^ *//;s/  */ /g')"
 
-# Urgency badge: derive the tier locally from cached priority/needsReview (no network)
-# plus the agent's live attention from the pane we already captured. Folds into
-# WORKSPACE_TITLE (and thus STATE_SIG) so it adds no extra cmux pushes.
-BOARD_CACHE="${DEV_BOARD_CACHE:-/tmp/dev-board/cache.json}"
-if [ -f "$BOARD_CACHE" ]; then
-  BOARD_LIB_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-  # shellcheck disable=SC1090
-  . "$BOARD_LIB_DIR/dev-board-lib.sh" 2>/dev/null || true
-  . "$BOARD_LIB_DIR/dev-board-state.sh" 2>/dev/null || true
-  BOARD_PRIO="$(jq -r --arg k "$SESSION" '.workspaces[]? | select(.key==$k) | .priority // 0' "$BOARD_CACHE" 2>/dev/null | head -1)"
-  BOARD_NR="$(jq -r --arg k "$SESSION" '.workspaces[]? | select(.key==$k) | (if .needsReview then 1 else 0 end)' "$BOARD_CACHE" 2>/dev/null | head -1)"
-  if [ -n "$BOARD_PRIO" ] && command -v tier_for >/dev/null 2>&1; then
-    BOARD_ATT="$(attention_from_pane "$PANE_CONTENT")"
-    BOARD_TIER="$(tier_for "${BOARD_PRIO:-0}" "${BOARD_NR:-0}" "$BOARD_ATT" 2>/dev/null || echo "")"
-    case "$BOARD_TIER" in
-      1) WORKSPACE_TITLE="🔴 ${WORKSPACE_TITLE}" ;;
-      2) WORKSPACE_TITLE="🔵 ${WORKSPACE_TITLE}" ;;
-      3) WORKSPACE_TITLE="🟠 ${WORKSPACE_TITLE}" ;;
-      4) WORKSPACE_TITLE="🟢 ${WORKSPACE_TITLE}" ;;
-      5) WORKSPACE_TITLE="⚪ ${WORKSPACE_TITLE}" ;;
-    esac
-  fi
-fi
-
 # --- Push state to the terminal titles and cmux, change-detected + rate-limited ---
 # Updating the window title (set-titles-string) every poll is the single biggest cost here:
 # each OSC title escape makes the host terminal - cmux especially - do heavy work, so one
