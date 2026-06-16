@@ -644,33 +644,41 @@ async function fetchLinearIssuesByIds(ids) {
 async function emitBoardJson(branches) {
   const PRIORITY_LABEL = { 0: null, 1: 'Urgent', 2: 'High', 3: 'Medium', 4: 'Low' };
 
-  // Each entry may be "branch" (plain) or "branch|ticket" (pipe-separated).
-  // Split on the FIRST pipe only; left = branch for gh pr view, right = explicit ticket.
+  // Each entry may be:
+  //   "branch"            — plain; ticket derived from branch name
+  //   "branch|ticket"     — explicit ticket, PR looked up by branch
+  //   "branch|ticket|pr"  — explicit ticket AND explicit PR number; gh pr view <pr> used instead of branch
+  // Split on '|' into up to 3 parts.
   const entries = branches.map((raw) => {
-    const pipeIdx = raw.indexOf('|');
-    if (pipeIdx === -1) {
-      const m = raw.toLowerCase().match(/([a-z]{2,7})-(\d{2,6})/);
-      return { branch: raw, ticket: m ? `${m[1].toUpperCase()}-${m[2]}` : null };
+    const parts = raw.split('|');
+    const branch = parts[0];
+    const rawTicket = parts[1]?.trim() ?? '';
+    const rawPr = parts[2]?.trim() ?? '';
+
+    let ticket;
+    if (rawTicket) {
+      ticket = rawTicket;
+    } else {
+      const m = branch.toLowerCase().match(/([a-z]{2,7})-(\d{2,6})/);
+      ticket = m ? `${m[1].toUpperCase()}-${m[2]}` : null;
     }
-    const branch = raw.slice(0, pipeIdx);
-    const explicit = raw.slice(pipeIdx + 1).trim();
-    if (explicit) {
-      return { branch, ticket: explicit };
-    }
-    // Explicit part was empty — fall back to deriving from the branch.
-    const m = branch.toLowerCase().match(/([a-z]{2,7})-(\d{2,6})/);
-    return { branch, ticket: m ? `${m[1].toUpperCase()}-${m[2]}` : null };
+
+    // prRef: if a PR number is explicitly provided, use it for gh pr view; else use the branch.
+    const prRef = rawPr || null;
+    return { branch, ticket, prRef };
   });
 
   const ids = [...new Set(entries.map((e) => e.ticket).filter(Boolean))];
   const linear = await fetchLinearIssuesByIds(ids);
 
   const out = [];
-  for (const { branch, ticket } of entries) {
+  for (const { branch, ticket, prRef } of entries) {
     const issue = ticket ? linear.get(ticket) : null;
     let pr = null;
+    // Use explicit PR number if provided, otherwise look up by branch name.
+    const ghRef = prRef ?? branch;
     try {
-      const { stdout } = await execFileP('gh', ['pr', 'view', branch, '--repo', ARGS.repo, '--json', PR_JSON_FIELDS]);
+      const { stdout } = await execFileP('gh', ['pr', 'view', ghRef, '--repo', ARGS.repo, '--json', PR_JSON_FIELDS]);
       const p = JSON.parse(stdout);
       pr = { number: p.number, state: p.state, isDraft: p.isDraft, reviewDecision: p.reviewDecision, mergeStateStatus: p.mergeStateStatus };
     } catch (err) {
@@ -679,7 +687,7 @@ async function emitBoardJson(branches) {
       // anything that doesn't look like that, so auth/network failures stay visible.
       const stderr = String(err?.stderr ?? '');
       if (stderr && !/no (open )?pull requests? found/i.test(stderr)) {
-        process.stderr.write(`linear-dash --json: gh pr view ${branch} failed: ${stderr.trim().split('\n')[0]}\n`);
+        process.stderr.write(`linear-dash --json: gh pr view ${ghRef} failed: ${stderr.trim().split('\n')[0]}\n`);
       }
     }
     out.push({

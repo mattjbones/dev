@@ -58,7 +58,12 @@ while IFS= read -r row; do
   br_tkt="$(parse_linear_id "$live_branch" || true)"
   ticket="${name_tkt:-$br_tkt}"
 
-  entry="${live_branch}|${ticket}"
+  # Read the active PR number from the workspace's agent pane (pane .0).
+  # Claude Code shows "PR #NNNNN" in the footer; capture-pane on a non-existent
+  # session returns empty → pane_pr stays empty → linear-dash falls back to branch lookup.
+  pane_pr="$(tmux capture-pane -t "${key}:.0" -p 2>/dev/null | grep -oiE 'PR #?[0-9]{3,6}' | tail -1 | grep -oE '[0-9]{3,6}' || true)"
+
+  entry="${live_branch}|${ticket}|${pane_pr}"
   if [ -z "$ENTRIES" ]; then
     ENTRIES="$entry"
   else
