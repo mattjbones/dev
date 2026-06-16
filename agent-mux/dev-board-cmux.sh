@@ -18,9 +18,10 @@ header_def() {
 
 list_ws() { "$CMUX_BIN" list-workspaces 2>/dev/null; }
 
-# ref of a workspace whose title contains $1 (literal match), else "".
+# ref of a header workspace whose title contains $1, else "". Handles the leading
+# "* " that cmux puts on the selected workspace (so $1 isn't mistaken for the ref).
 ref_for_title() {
-  list_ws | awk -v t="$1" 'index($0, t) {print $1; exit}'
+  list_ws | awk -v t="$1" 'index($0, t) { print ($1 == "*") ? $2 : $1; exit }'
 }
 
 # Header refs stored as plain variables: HEADER_REF_1 .. HEADER_REF_4
@@ -44,24 +45,32 @@ ensure_headers() {
   done
 }
 
-# ref of the real workspace matching key $1 (literal match), else "".
+# ref of the real workspace whose TITLE (the columns after the ref) contains key $1.
+# Normalizes the selected "* " prefix and never matches the ref token itself.
 ref_for_key() {
-  list_ws | awk -v k="$1" 'index($0, k) {print $1; exit}'
+  list_ws | awk -v k="$1" '
+    { ref = ($1 == "*") ? $2 : $1
+      start = ($1 == "*") ? 3 : 2
+      title = ""
+      for (j = start; j <= NF; j++) title = title (title == "" ? "" : " ") $j
+      if (index(title, k)) { print ref; exit }
+    }'
 }
 
 main() {
   local ranked; ranked="$(cat)"
   ensure_headers
   local n; n="$(printf '%s' "$ranked" | jq 'length')"
+  [ "$n" -eq 0 ] && return 0
   local i key tier wref href
   for i in $(seq 0 $((n - 1))); do
-    [ "$n" -eq 0 ] && break
     key="$(printf '%s' "$ranked" | jq -r ".[$i].key")"
     tier="$(printf '%s' "$ranked" | jq -r ".[$i].tier")"
     wref="$(ref_for_key "$key")"
     href="$(header_ref_get "$tier")"
     [ -n "$wref" ] && [ -n "$href" ] || continue
     "$CMUX_BIN" reorder-workspace --workspace "$wref" --after "$href" >/dev/null 2>&1 || true
+    # Tier-1 real workspaces also go Red so the "act now" items pop, matching their header.
     [ "$tier" = "1" ] && "$CMUX_BIN" workspace-action --workspace "$wref" --action set-color --color Red >/dev/null 2>&1 || true
   done
 }

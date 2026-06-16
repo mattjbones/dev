@@ -13,7 +13,7 @@ cat > "$STUB/cmux" <<EOF
 echo "\$*" >> "$LOG"
 case "\$1" in
   list-workspaces)
-    echo "  workspace:1  eng-7443"
+    echo "* workspace:1  eng-7443"
     echo "  workspace:2  appt-moving"
     [ -f "$WS_FILE" ] && cat "$WS_FILE" || true
     ;;
@@ -39,4 +39,7 @@ printf '%s' "$RANKED" | "$DIR/../dev-board-cmux.sh"
 assert_eq "$(grep -c 'new-workspace' "$LOG")" "4" "creates 4 headers"
 # Reorder calls issued for the two real workspaces.
 assert_eq "$(grep -c 'reorder-workspace' "$LOG")" "2" "reorders real workspaces"
+# Regression: selected workspace must be reordered by its real ref, not the literal "*".
+if grep -q 'reorder-workspace --workspace workspace:1 --after' "$LOG"; then pass; else fail "selected workspace reordered by real ref, not *"; fi
+if grep -q 'reorder-workspace --workspace \* ' "$LOG"; then fail "reorder used literal * (selected-prefix bug)"; else pass; fi
 finish
