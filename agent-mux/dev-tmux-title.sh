@@ -145,6 +145,19 @@ fi
 WORKSPACE_TITLE="${SERVER_ICON} ${AGENT_ICON} ${WORKSPACE_NAME}${CLAUDE_STATUS}${TOKEN_INFO}"
 WORKSPACE_TITLE="$(printf '%s' "$WORKSPACE_TITLE" | sed 's/^ *//;s/  */ /g')"
 
+# Urgency badge from the board cache (local file, no network). Folds into WORKSPACE_TITLE
+# (and therefore STATE_SIG) so it adds no extra cmux pushes.
+BOARD_CACHE="${DEV_BOARD_CACHE:-/tmp/dev-board/cache.json}"
+if [ -f "$BOARD_CACHE" ]; then
+  BOARD_TIER="$(jq -r --arg k "$SESSION" '.workspaces[]? | select(.key==$k) | .tier // empty' "$BOARD_CACHE" 2>/dev/null | head -1)"
+  case "$BOARD_TIER" in
+    1) WORKSPACE_TITLE="🔴 ${WORKSPACE_TITLE}" ;;
+    2) WORKSPACE_TITLE="🟠 ${WORKSPACE_TITLE}" ;;
+    3) WORKSPACE_TITLE="🟢 ${WORKSPACE_TITLE}" ;;
+    4) WORKSPACE_TITLE="⚪ ${WORKSPACE_TITLE}" ;;
+  esac
+fi
+
 # --- Push state to the terminal titles and cmux, change-detected + rate-limited ---
 # Updating the window title (set-titles-string) every poll is the single biggest cost here:
 # each OSC title escape makes the host terminal - cmux especially - do heavy work, so one
