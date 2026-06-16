@@ -25,5 +25,9 @@ assert_eq "$(tier_for 3 1 working)"  "2" "med+review = needs you"
 assert_eq "$(tier_for 0 0 blocked)"  "2" "none+blocked = needs you"
 assert_eq "$(tier_for 3 0 working)"  "3" "working"
 assert_eq "$(tier_for 4 0 idle)"     "4" "parked"
+assert_eq "$(tier_for 3 0 idle)"     "3" "medium idle = still actioning (In Progress)"
+assert_eq "$(tier_for 2 0 idle)"     "3" "high idle = In Progress"
+assert_eq "$(tier_for 0 0 idle)"     "4" "none idle = parked"
+assert_eq "$(tier_for 4 0 working)"  "3" "low but working = In Progress"
 
 finish
