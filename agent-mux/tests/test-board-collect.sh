@@ -5,7 +5,7 @@ source "$DIR/board-test-helpers.sh"
 
 # Stub linear-dash on PATH so no network is hit.
 STUB="$(mktemp -d)"
-trap 'rm -rf "$STUB"' EXIT
+trap 'rm -rf "$STUB" "${FIX:-}"' EXIT
 export STUB_LOG="$STUB/log"
 cat > "$STUB/linear-dash" <<'EOF'
 #!/usr/bin/env bash
@@ -27,4 +27,16 @@ calls1="$(wc -l < "$STUB_LOG" | tr -d ' ')"
 echo "$WL" | "$DIR/../dev-board-collect.sh" --stdin >/dev/null
 calls2="$(wc -l < "$STUB_LOG" | tr -d ' ')"
 assert_eq "$calls2" "$calls1" "TTL skips network"
+# --- Enumeration via dev-session-sync manifest (the real, non --stdin path) ---
+FIX="$(mktemp -d)"
+host="$(hostname -s)"
+cat > "$FIX/$host.json" <<EOF
+[{"session":"eng-7443","branch":"eng-7443","worktree":"/tmp/eng-7443","model":"claude","status":"active","host":"$host","updatedAt":"x"},
+ {"session":"gone","branch":"gone","worktree":"/tmp/gone","model":"claude","status":"inactive","host":"$host","updatedAt":"x"}]
+EOF
+export DEV_BOARD_CACHE="$FIX/cache.json" DEV_SESSION_SYNC_DIR="$FIX"
+"$DIR/../dev-board-collect.sh" --refresh >/dev/null
+assert_eq "$(jq -r '.workspaces | length' "$DEV_BOARD_CACHE")" "1" "only active session enumerated"
+assert_eq "$(jq -r '.workspaces[0].key' "$DEV_BOARD_CACHE")" "eng-7443" "enumerated the active session"
+assert_eq "$(jq -r '.workspaces[0].worktree' "$DEV_BOARD_CACHE")" "/tmp/eng-7443" "worktree carried through"
 finish

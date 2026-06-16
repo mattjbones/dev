@@ -26,8 +26,12 @@ fi
 if [ "$STDIN" -eq 1 ]; then
   WL="$(cat)"
 else
-  WL="$("$DIR/dev-session-sync.sh" list 2>/dev/null \
-        | jq '[.[] | select(.active == true) | {key: .session, branch: .branch, worktree: .worktree}]' 2>/dev/null || echo '[]')"
+  # Enumerate this host's active dev sessions from the manifest (machine-readable).
+  # Remote-host sessions are excluded: they have no local tmux pane or cmux workspace.
+  host="$(hostname -s 2>/dev/null || echo unknown)"
+  WL="$("$DIR/dev-session-sync.sh" list --json 2>/dev/null \
+        | jq --arg h "$host" '[.[] | select(.status == "active" and .host == $h)
+            | {key: .session, branch: .branch, worktree: .worktree}]' 2>/dev/null || echo '[]')"
 fi
 
 branches="$(printf '%s' "$WL" | jq -r '[.[].branch] | join(",")')"
