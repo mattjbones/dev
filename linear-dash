@@ -67,7 +67,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 // ---------- args ----------
 function parseArgs(argv) {
-  const args = { project: null, repo: DEFAULT_REPO, watch: null, all: false, showCancelled: false };
+  const args = { project: null, repo: DEFAULT_REPO, watch: null, all: false, showCancelled: false, json: false, branches: [] };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--repo') {
@@ -89,6 +89,10 @@ function parseArgs(argv) {
       console.log('  --watch keys: j/k move · h/l section · Ctrl-d/u half-page · g/G ends');
       console.log('                / search · n/N next match · ↵ details · m extras · q quit');
       process.exit(0);
+    } else if (a === '--json') {
+      args.json = true;
+    } else if (a === '--branches') {
+      args.branches = (argv[++i] || '').split(',').map((s) => s.trim()).filter(Boolean);
     } else {
       args.project = a;
     }
@@ -633,6 +637,43 @@ async function fetchLinearIssuesByIds(ids) {
     // enrichment only — sections still render without Linear
   }
   return byId;
+}
+
+// Machine-readable per-branch ticket+PR snapshot for the dev urgency board.
+// Input: branch names. Output (stdout): JSON array, no ANSI, safe to pipe.
+async function emitBoardJson(branches) {
+  const PRIORITY_LABEL = { 0: null, 1: 'Urgent', 2: 'High', 3: 'Medium', 4: 'Low' };
+  const ticketByBranch = new Map();
+  for (const b of branches) {
+    const m = b.toLowerCase().match(/([a-z]{2,7})-(\d{2,6})/);
+    ticketByBranch.set(b, m ? `${m[1].toUpperCase()}-${m[2]}` : null);
+  }
+  const ids = [...new Set([...ticketByBranch.values()].filter(Boolean))];
+  const linear = await fetchLinearIssuesByIds(ids);
+
+  const out = [];
+  for (const branch of branches) {
+    const ticket = ticketByBranch.get(branch);
+    const issue = ticket ? linear.get(ticket) : null;
+    let pr = null;
+    try {
+      const { stdout } = await execFileP('gh', ['pr', 'view', branch, '--repo', ARGS.repo, '--json', PR_JSON_FIELDS]);
+      const p = JSON.parse(stdout);
+      pr = { number: p.number, state: p.state, isDraft: p.isDraft, reviewDecision: p.reviewDecision, mergeStateStatus: p.mergeStateStatus };
+    } catch {
+      pr = null;
+    }
+    out.push({
+      branch,
+      ticket,
+      priority: issue ? issue.priority : 0,
+      priorityLabel: issue ? PRIORITY_LABEL[issue.priority] : null,
+      linearState: issue?.state?.name ?? null,
+      linearStateType: issue?.state?.type ?? null,
+      pr,
+    });
+  }
+  process.stdout.write(JSON.stringify(out));
 }
 
 // ---------- details page data (lazy, on Enter) ----------
@@ -1290,7 +1331,12 @@ async function compute() {
 const buildItems = (data) => render(data.project, data.rows, data.sourceLabel, data.extras, data.now);
 const flatten = (items) => items.map((i) => i.text).join('\n');
 
-if (ARGS.watch != null) {
+if (ARGS.json) {
+  emitBoardJson(ARGS.branches).catch((err) => {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  });
+} else if (ARGS.watch != null) {
   const interval = Math.max(10, ARGS.watch) * 1000;
   const onTty = Boolean(process.stdout.isTTY);
   // Render into the alternate screen buffer (like top/less) so refreshes don't
