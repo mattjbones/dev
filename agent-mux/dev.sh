@@ -393,6 +393,11 @@ tmux set-option -t "$SESSION" set-titles-string "$AGENT_ICON $WORKSPACE_NAME"
 tmux set-option -t "$SESSION" status-interval 15
 tmux set-option -t "$SESSION" status-right "#(${TITLE_SCRIPT} \"$SESSION\" \"$WORKSPACE_NAME\" \"$WORKTREE\" \"$MODEL\" \"$AGENT_ICON\" \"$AGENT_LABEL\")  %H:%M"
 
+# Refresh the board cache on attach/switch, in the background and only if stale
+# (dev-board-collect.sh self-gates on TTL, so this is cheap when the cache is warm).
+tmux set-hook -t "$SESSION" client-attached \
+  "run-shell -b '$SCRIPT_DIR/dev-board-collect.sh >/dev/null 2>&1'"
+
 # Focus the agent pane
 tmux select-pane -t "$SESSION:.0"
 
