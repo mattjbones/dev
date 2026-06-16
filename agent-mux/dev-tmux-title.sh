@@ -230,3 +230,34 @@ if [ -x "$__CMUX_BIN" ]; then
     fi
   fi
 fi
+
+# --- Refresh titles for backgrounded (0-client) workspaces ---
+# cmux only attaches a tmux client to a workspace it has opened, so never-opened/backgrounded
+# sessions never run their own status-right and their sidebar titles freeze. Any polling
+# session sweeps them, throttled to once per DEV_TITLE_SWEEP_INTERVAL across all sessions
+# (atomic mkdir lock + timestamp). Only relevant under cmux (many backgrounded surfaces).
+if [ -x "$__CMUX_BIN" ]; then
+  SWEEP_INTERVAL="${DEV_TITLE_SWEEP_INTERVAL:-30}"
+  SWEEP_STAMP="/tmp/dev-tmux-title/.title-sweep"
+  SWEEP_LOCK="/tmp/dev-tmux-title/.title-sweep.lock"
+  mkdir -p /tmp/dev-tmux-title 2>/dev/null || true
+  # Drop a stale lock left by a sweep that died before releasing it.
+  [ -n "$(find "$SWEEP_LOCK" -mmin +2 2>/dev/null)" ] && rmdir "$SWEEP_LOCK" 2>/dev/null
+  SWEEP_NOW="$(date +%s)"
+  SWEEP_M="$(stat -f %m "$SWEEP_STAMP" 2>/dev/null || echo 0)"
+  if [ "$(( SWEEP_NOW - SWEEP_M ))" -ge "$SWEEP_INTERVAL" ] && mkdir "$SWEEP_LOCK" 2>/dev/null; then
+    touch "$SWEEP_STAMP" 2>/dev/null || true
+    (
+      for __s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
+        # Skip sessions that poll themselves (they have an attached tmux client).
+        [ "$(tmux list-clients -t "$__s" 2>/dev/null | wc -l | tr -d ' ')" -eq 0 ] || continue
+        __sr="$(tmux show-options -t "$__s" -v status-right 2>/dev/null)"
+        case "$__sr" in *dev-tmux-title.sh*) ;; *) continue ;; esac
+        # Recover the title invocation from "#(<cmd>)  %H:%M" and re-run it.
+        __cmd="${__sr#*#(}"; __cmd="${__cmd%")  %H:%M"}"
+        [ -n "$__cmd" ] && eval "$__cmd" >/dev/null 2>&1
+      done
+      rmdir "$SWEEP_LOCK" 2>/dev/null || true
+    ) &
+  fi
+fi
