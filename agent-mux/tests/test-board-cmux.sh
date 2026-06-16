@@ -76,6 +76,9 @@ assert_eq "$(grep -c 'action clear-color' "$LOG" || true)" "0" "no clear-color c
 # --- set-color calls are exactly 6 (one per header only) ---
 assert_eq "$(grep -c 'action set-color' "$LOG")" "6" "exactly 6 set-color calls (headers only)"
 
+# --- a description is set for each header (6 set-description calls) ---
+assert_eq "$(grep -c 'set-description' "$LOG")" "6" "a description is set for each header"
+
 # --- no literal * used in reorder calls ---
 if grep -q 'reorder-workspace --workspace \* ' "$LOG"; then
   fail "reorder used literal * (selected-prefix bug)"

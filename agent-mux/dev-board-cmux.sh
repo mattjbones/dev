@@ -19,6 +19,18 @@ header_def() {
   esac
 }
 
+# header_desc <tier> -> one-line explanation shown as the header's cmux description
+header_desc() {
+  case "$1" in
+    1) echo "Urgent (P1) in Linear — drop everything" ;;
+    2) echo "Approved + green CI — just merge" ;;
+    3) echo "Open PR awaiting review" ;;
+    4) echo "Agent blocked — needs your input" ;;
+    5) echo "Agent working, or mid-priority WIP" ;;
+    6) echo "Low / no priority, idle" ;;
+  esac
+}
+
 list_ws() { "$CMUX_BIN" list-workspaces 2>/dev/null; }
 
 # ref of a header workspace whose title contains $1, else "". Handles the leading
@@ -67,6 +79,7 @@ ensure_headers() {
     [ -n "$ref" ] || continue
     "$CMUX_BIN" workspace-action --workspace "$ref" --action unpin >/dev/null 2>&1 || true
     "$CMUX_BIN" workspace-action --workspace "$ref" --action set-color --color "$color" >/dev/null 2>&1 || true
+    "$CMUX_BIN" workspace-action --workspace "$ref" --action set-description --description "$(header_desc "$tier")" >/dev/null 2>&1 || true
     header_ref_set "$tier" "$ref"
   done
 }
