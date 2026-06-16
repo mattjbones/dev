@@ -162,21 +162,31 @@ WORKSPACE_TITLE="$(printf '%s' "$WORKSPACE_TITLE" | sed 's/^ *//;s/  */ /g')"
 STATE_JITTER=$(( $(printf '%s' "$WORKSPACE_NAME" | cksum | cut -d' ' -f1) % 15 ))
 STATE_MIN_INTERVAL=$(( 30 + STATE_JITTER ))
 STATE_TTL=60
+# IMPORTANT = structural state that should reflect immediately (docker/server/build icon,
+# build status, agent pane title). Full sig adds the noisy bits (token %, claude status)
+# that we rate-limit to avoid flooding cmux.
+IMPORTANT_SIG="${SERVER_ICON}|${BUILD_STATUS_VALUE}|${BUILD_PANE_TITLE}|${AGENT_PANE_TITLE}"
 STATE_SIG="${WORKSPACE_TITLE}|${AGENT_PANE_TITLE}|${BUILD_PANE_TITLE}|${BUILD_STATUS_VALUE}|${CONTEXT_STATUS_VALUE}|${PERCENT}"
 SIG_FILE="/tmp/dev-tmux-title/${WORKSPACE_NAME}-state-sig"
 mkdir -p /tmp/dev-tmux-title 2>/dev/null
 
-STATE_CACHED=""
-[ -f "$SIG_FILE" ] && STATE_CACHED="$(cat "$SIG_FILE" 2>/dev/null)"
+STATE_CACHED_IMP=""; STATE_CACHED_FULL=""
+if [ -f "$SIG_FILE" ]; then
+  STATE_CACHED_IMP="$(sed -n '1p' "$SIG_FILE" 2>/dev/null)"
+  STATE_CACHED_FULL="$(sed -n '2p' "$SIG_FILE" 2>/dev/null)"
+fi
 STATE_MTIME="$(stat -f %m "$SIG_FILE" 2>/dev/null || echo 0)"
 STATE_ELAPSED=$(( $(date +%s) - STATE_MTIME ))
 
 STATE_PUSH=false
-if [ "$STATE_CACHED" != "$STATE_SIG" ]; then
-  # Changed - push, but no more often than once per STATE_MIN_INTERVAL per workspace.
+if [ "$STATE_CACHED_IMP" != "$IMPORTANT_SIG" ]; then
+  # Structural change (e.g. docker started/stopped) -> reflect immediately, no rate-limit.
+  STATE_PUSH=true
+elif [ "$STATE_CACHED_FULL" != "$STATE_SIG" ]; then
+  # Only the noisy bits changed (token %, status) -> rate-limit.
   [ "$STATE_ELAPSED" -ge "$STATE_MIN_INTERVAL" ] && STATE_PUSH=true
 else
-  # Unchanged - re-push only after the TTL so titles/cmux self-heal after a restart.
+  # Nothing changed -> re-push after the TTL so cmux self-heals after a restart.
   [ "$STATE_ELAPSED" -ge "$STATE_TTL" ] && STATE_PUSH=true
 fi
 
@@ -206,7 +216,7 @@ if [ "$STATE_PUSH" = true ]; then
     fi
   fi
 
-  printf '%s' "$STATE_SIG" > "$SIG_FILE" 2>/dev/null || true
+  printf '%s\n%s' "$IMPORTANT_SIG" "$STATE_SIG" > "$SIG_FILE" 2>/dev/null || true
 fi
 
 # --- Periodic sidebar re-sort (local-only, no network) ---
