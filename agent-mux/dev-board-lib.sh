@@ -20,19 +20,20 @@ priority_rank() {
   esac
 }
 
-# tier_for <priority 0..4> <needsReview 0|1> <attention blocked|working|idle> -> 1..4
-# 1 Act Now   = high priority (Urgent/High) AND needs action (review or blocked)
-# 2 Needs You = needs action (any priority), not tier 1
-# 3 In Progress = agent working, OR an idle item that is NOT low priority (still actioning)
-# 4 Parked    = low/none priority, idle, no action
+# tier_for <priority 0..4> <needsReview 0|1> <attention blocked|working|idle> -> 1..5
+# 1 Act Now            = high priority (Urgent/High) AND needs action (in-review or blocked)
+# 2 Waiting for Review = in review (open PR / Linear "In Review"), not tier 1
+# 3 Needs You          = agent blocked waiting on you, not tier 1/2
+# 4 In Progress        = agent working, OR an idle item that is NOT low priority (still actioning)
+# 5 Parked             = low/none priority, idle, no action
 tier_for() {
   local priority="${1:?}" needs_review="${2:?}" attention="${3:?}"
-  local high=0 needs_action=0 low=0
+  local high=0 low=0
   { [ "$priority" = "1" ] || [ "$priority" = "2" ]; } && high=1
-  { [ "$needs_review" = "1" ] || [ "$attention" = "blocked" ]; } && needs_action=1
   { [ "$priority" = "0" ] || [ "$priority" = "4" ]; } && low=1
-  if [ "$high" = "1" ] && [ "$needs_action" = "1" ]; then echo 1
-  elif [ "$needs_action" = "1" ]; then echo 2
-  elif [ "$attention" = "working" ] || [ "$low" = "0" ]; then echo 3
-  else echo 4; fi
+  if [ "$high" = "1" ] && { [ "$needs_review" = "1" ] || [ "$attention" = "blocked" ]; }; then echo 1
+  elif [ "$needs_review" = "1" ]; then echo 2
+  elif [ "$attention" = "blocked" ]; then echo 3
+  elif [ "$attention" = "working" ] || [ "$low" = "0" ]; then echo 4
+  else echo 5; fi
 }

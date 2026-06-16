@@ -5,7 +5,7 @@ DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 source "$DIR/dev-board-lib.sh"
 source "$DIR/dev-board-state.sh"
 
-TIER_GLYPH() { case "$1" in 1) echo 🔴;; 2) echo 🟠;; 3) echo 🟢;; *) echo ⚪;; esac; }
+TIER_GLYPH() { case "$1" in 1) echo 🔴;; 2) echo 🔵;; 3) echo 🟠;; 4) echo 🟢;; *) echo ⚪;; esac; }
 
 # board_render_lines <focus-epoch>  (ranked JSON on stdin) -> tab-separated rows: key<TAB>display
 board_render_lines() {
