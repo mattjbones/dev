@@ -34,15 +34,50 @@ else
             | {key: .session, branch: .branch, worktree: .worktree}]' 2>/dev/null || echo '[]')"
 fi
 
-branches="$(printf '%s' "$WL" | jq -r '[.[].branch] | join(",")')"
-if [ -z "$branches" ]; then
+# Build entries for linear-dash and a normalised workspace list (WL2) where
+# each record's .branch is replaced with the live git branch for that worktree.
+# This makes the merge key (branch) agree between WL2 and the snapshot.
+ENTRIES=""
+WL2="[]"
+while IFS= read -r row; do
+  key="$(printf '%s' "$row" | jq -r '.key')"
+  manifest_branch="$(printf '%s' "$row" | jq -r '.branch')"
+  worktree="$(printf '%s' "$row" | jq -r '.worktree // ""')"
+
+  # Prefer the live git branch; fall back to the manifest branch.
+  live_branch=""
+  if [ -n "$worktree" ]; then
+    live_branch="$(git -C "$worktree" branch --show-current 2>/dev/null || true)"
+  fi
+  if [ -z "$live_branch" ]; then
+    live_branch="$manifest_branch"
+  fi
+
+  # Ticket preference: session name first, then live branch.
+  name_tkt="$(parse_linear_id "$key" || true)"
+  br_tkt="$(parse_linear_id "$live_branch" || true)"
+  ticket="${name_tkt:-$br_tkt}"
+
+  entry="${live_branch}|${ticket}"
+  if [ -z "$ENTRIES" ]; then
+    ENTRIES="$entry"
+  else
+    ENTRIES="${ENTRIES},${entry}"
+  fi
+
+  # Update the workspace record to use live_branch as .branch.
+  updated_row="$(printf '%s' "$row" | jq --arg lb "$live_branch" '. + {branch: $lb}')"
+  WL2="$(printf '%s' "$WL2" | jq --argjson r "$updated_row" '. + [$r]')"
+done < <(printf '%s' "$WL" | jq -c '.[]')
+
+if [ -z "$ENTRIES" ]; then
   SNAP='[]'
 else
-  SNAP="$(linear-dash --json --branches "$branches" 2>/dev/null || echo '[]')"
+  SNAP="$(linear-dash --json --branches "$ENTRIES" 2>/dev/null || echo '[]')"
 fi
 
 # Merge snapshot into workspace list by branch; compute needsReview.
-MERGED="$(printf '%s' "$WL" | jq --argjson snap "$SNAP" '
+MERGED="$(printf '%s' "$WL2" | jq --argjson snap "$SNAP" '
   ($snap | map({(.branch): .}) | add // {}) as $byBranch
   | map(. as $w | ($byBranch[$w.branch] // {}) as $s
       | $w + {

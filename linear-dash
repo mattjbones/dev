@@ -643,17 +643,30 @@ async function fetchLinearIssuesByIds(ids) {
 // Input: branch names. Output (stdout): JSON array, no ANSI, safe to pipe.
 async function emitBoardJson(branches) {
   const PRIORITY_LABEL = { 0: null, 1: 'Urgent', 2: 'High', 3: 'Medium', 4: 'Low' };
-  const ticketByBranch = new Map();
-  for (const b of branches) {
-    const m = b.toLowerCase().match(/([a-z]{2,7})-(\d{2,6})/);
-    ticketByBranch.set(b, m ? `${m[1].toUpperCase()}-${m[2]}` : null);
-  }
-  const ids = [...new Set([...ticketByBranch.values()].filter(Boolean))];
+
+  // Each entry may be "branch" (plain) or "branch|ticket" (pipe-separated).
+  // Split on the FIRST pipe only; left = branch for gh pr view, right = explicit ticket.
+  const entries = branches.map((raw) => {
+    const pipeIdx = raw.indexOf('|');
+    if (pipeIdx === -1) {
+      const m = raw.toLowerCase().match(/([a-z]{2,7})-(\d{2,6})/);
+      return { branch: raw, ticket: m ? `${m[1].toUpperCase()}-${m[2]}` : null };
+    }
+    const branch = raw.slice(0, pipeIdx);
+    const explicit = raw.slice(pipeIdx + 1).trim();
+    if (explicit) {
+      return { branch, ticket: explicit };
+    }
+    // Explicit part was empty — fall back to deriving from the branch.
+    const m = branch.toLowerCase().match(/([a-z]{2,7})-(\d{2,6})/);
+    return { branch, ticket: m ? `${m[1].toUpperCase()}-${m[2]}` : null };
+  });
+
+  const ids = [...new Set(entries.map((e) => e.ticket).filter(Boolean))];
   const linear = await fetchLinearIssuesByIds(ids);
 
   const out = [];
-  for (const branch of branches) {
-    const ticket = ticketByBranch.get(branch);
+  for (const { branch, ticket } of entries) {
     const issue = ticket ? linear.get(ticket) : null;
     let pr = null;
     try {
