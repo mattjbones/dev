@@ -25,8 +25,11 @@ board_ranked() {
   local ws; ws="$(printf '%s' "$cache" | jq '.workspaces')"
   local n i key att lf merged="[]"
   n="$(printf '%s' "$ws" | jq 'length')"
+  if [ "$n" -eq 0 ]; then
+    printf '%s' "$merged" | "$DIR/dev-board-rank.sh"
+    return
+  fi
   for i in $(seq 0 $((n - 1))); do
-    [ "$n" -eq 0 ] && break
     key="$(printf '%s' "$ws" | jq -r ".[$i].key")"
     att="$(attention_for_session "$key")"; lf="$(last_focus_for_session "$key")"
     merged="$(printf '%s' "$ws" | jq --argjson m "$merged" --arg k "$key" --arg a "$att" --argjson lf "${lf:-0}" \
@@ -43,7 +46,7 @@ board_pick() {
   local sel
   sel="$(printf '%s' "$ranked" | board_render_lines "$focus" \
         | fzf --ansi --with-nth=2.. --delimiter='\t' --prompt='board> ' \
-        | cut -f1)"
+        | cut -f1)" || true
   [ -n "$sel" ] && exec "$DIR/dev.sh" "$sel"
 }
 

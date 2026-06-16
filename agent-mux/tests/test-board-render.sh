@@ -2,7 +2,7 @@
 set -euo pipefail
 DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$DIR/board-test-helpers.sh"
-source "$DIR/../dev-board.sh"   # sourcing must NOT run the picker (guarded by ${1})
+source "$DIR/../dev-board.sh"   # sourcing must NOT run the picker (guarded by BASH_SOURCE[0]==$0 at file end)
 
 RANKED='[{"key":"eng-7443","ticket":"ENG-7443","priorityLabel":"High","tier":1,"attention":"blocked","lastFocus":99},
          {"key":"calm","ticket":null,"priorityLabel":null,"tier":4,"attention":"idle","lastFocus":1}]'
