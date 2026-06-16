@@ -19,23 +19,35 @@ board_render_lines() {
       done
 }
 
+# rank_workspaces <workspaces-json-array> -> ranked JSON (attaches fresh local attention + lastFocus).
+rank_workspaces() {
+  local ws="$1" n i key att lf merged="[]"
+  n="$(printf '%s' "$ws" | jq 'length')"
+  if [ "$n" -gt 0 ]; then
+    for i in $(seq 0 $((n - 1))); do
+      key="$(printf '%s' "$ws" | jq -r ".[$i].key")"
+      att="$(attention_for_session "$key")"; lf="$(last_focus_for_session "$key")"
+      merged="$(printf '%s' "$ws" | jq --argjson m "$merged" --arg k "$key" --arg a "$att" --argjson lf "${lf:-0}" \
+                '$m + [(.[] | select(.key==$k)) + {attention:$a, lastFocus:$lf}]')"
+    done
+  fi
+  printf '%s' "$merged" | "$DIR/dev-board-rank.sh"
+}
+
 # Build the merged+ranked records (collect cache -> + local state -> rank).
 board_ranked() {
   local cache; cache="$("$DIR/dev-board-collect.sh")"
   local ws; ws="$(printf '%s' "$cache" | jq '.workspaces')"
-  local n i key att lf merged="[]"
-  n="$(printf '%s' "$ws" | jq 'length')"
-  if [ "$n" -eq 0 ]; then
-    printf '%s' "$merged" | "$DIR/dev-board-rank.sh"
-    return
-  fi
-  for i in $(seq 0 $((n - 1))); do
-    key="$(printf '%s' "$ws" | jq -r ".[$i].key")"
-    att="$(attention_for_session "$key")"; lf="$(last_focus_for_session "$key")"
-    merged="$(printf '%s' "$ws" | jq --argjson m "$merged" --arg k "$key" --arg a "$att" --argjson lf "${lf:-0}" \
-              '$m + [(.[] | select(.key==$k)) + {attention:$a, lastFocus:$lf}]')"
-  done
-  printf '%s' "$merged" | "$DIR/dev-board-rank.sh"
+  rank_workspaces "$ws"
+}
+
+# Local reflection: rank from the EXISTING cache file (no collector/network) and reorder cmux.
+board_reflect() {
+  local cache ws ranked
+  cache="$(cat "${DEV_BOARD_CACHE:-/tmp/dev-board/cache.json}" 2>/dev/null || echo '{}')"
+  ws="$(printf '%s' "$cache" | jq '.workspaces // []' 2>/dev/null || echo '[]')"
+  ranked="$(rank_workspaces "$ws")"
+  printf '%s' "$ranked" | "$DIR/dev-board-cmux.sh" >/dev/null 2>&1 || true
 }
 
 # Interactive picker; enter attaches via dev.
@@ -54,6 +66,7 @@ board_pick() {
 if [ "${BASH_SOURCE[0]:-}" = "${0:-}" ]; then
   case "${1:-}" in
     --refresh) "$DIR/dev-board-collect.sh" --refresh >/dev/null; board_pick ;;
+    --reflect) board_reflect ;;
     *) board_pick ;;
   esac
 fi
