@@ -208,6 +208,10 @@ case "${1:-}" in
     shift
     exec "$SCRIPT_DIR/dev-session-sync.sh" sync "$@"
     ;;
+  board)
+    shift
+    exec "$SCRIPT_DIR/dev-board.sh" "$@"
+    ;;
 esac
 
 if [ "${1:-}" = "--" ]; then
