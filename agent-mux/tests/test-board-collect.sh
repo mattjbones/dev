@@ -28,6 +28,17 @@ calls1="$(wc -l < "$STUB_LOG" | tr -d ' ')"
 echo "$WL" | "$DIR/../dev-board-collect.sh" --stdin >/dev/null
 calls2="$(wc -l < "$STUB_LOG" | tr -d ' ')"
 assert_eq "$calls2" "$calls1" "TTL skips network"
+
+# --- Open DRAFT PR -> reviewState "draft" ---
+cat > "$STUB/linear-dash" <<'EOF'
+#!/usr/bin/env bash
+echo "STUBCALL" >> "$STUB_LOG"
+echo '[{"branch":"eng-7443","ticket":"ENG-7443","priority":2,"priorityLabel":"High","linearState":"In Progress","linearStateType":"started","pr":{"number":2,"state":"OPEN","isDraft":true,"reviewDecision":"","mergeStateStatus":"UNKNOWN"}}]'
+EOF
+chmod +x "$STUB/linear-dash"
+echo "$WL" | "$DIR/../dev-board-collect.sh" --stdin --refresh >/dev/null
+assert_eq "$(jq -r '.workspaces[0].reviewState' "$DEV_BOARD_CACHE")" "draft" "reviewState from open DRAFT PR"
+assert_eq "$(jq -r '.workspaces[0].needsReview' "$DEV_BOARD_CACHE")" "false" "draft PR does not need review"
 # --- Enumeration via dev-session-sync manifest (the real, non --stdin path) ---
 FIX="$(mktemp -d)"
 host="$(hostname -s)"

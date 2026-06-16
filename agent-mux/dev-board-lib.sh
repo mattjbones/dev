@@ -20,10 +20,9 @@ priority_rank() {
   esac
 }
 
-# tier_for <priority 0..4> <reviewState merge|review|none> <attention blocked|working|idle> -> 1..6
-# Act Now is reserved for Linear Urgent (priority 1) — always top, regardless of state.
-# Otherwise: blocked > working > ready-to-merge > in-review > medium+ idle > low/none idle.
-# 1 Act Now  2 Ready to Merge  3 Waiting for Review  4 Needs You  5 In Progress  6 Parked
+# tier_for <priority 0..4> <reviewState merge|review|draft|none> <attention blocked|working|idle> -> 1..6
+# Act Now = Linear Urgent (1), always. Otherwise: blocked > working > ready-to-merge >
+# in-review > draft (WIP) > medium+ idle > low/none idle. Draft PRs are WIP -> In Progress.
 tier_for() {
   local priority="${1:?}" review="${2:?}" attention="${3:?}"
   local low=0
@@ -33,6 +32,7 @@ tier_for() {
   elif [ "$attention" = "working" ]; then echo 5
   elif [ "$review" = "merge" ]; then echo 2
   elif [ "$review" = "review" ]; then echo 3
+  elif [ "$review" = "draft" ]; then echo 5
   elif [ "$low" = "0" ]; then echo 5
   else echo 6
   fi

@@ -34,5 +34,8 @@ assert_eq "$(tier_for 3 none idle)"      "5" "medium idle = in progress"
 assert_eq "$(tier_for 2 none idle)"      "5" "high idle no action = in progress"
 assert_eq "$(tier_for 4 none idle)"      "6" "low idle = parked"
 assert_eq "$(tier_for 0 none idle)"      "6" "none idle = parked"
+assert_eq "$(tier_for 0 draft idle)" "5" "draft PR (none priority) = in progress"
+assert_eq "$(tier_for 4 draft idle)" "5" "draft PR (low priority) = in progress"
+assert_eq "$(tier_for 3 draft idle)" "5" "draft PR (medium) = in progress"
 
 finish
