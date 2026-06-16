@@ -60,7 +60,7 @@ Inside the session — prefix is **Ctrl-a** (Ctrl-b is captured by Claude Code):
 | `Ctrl-a m` | toggle mouse mode |
 | mouse | click panes, drag borders (on by default) |
 
-The Ghostty tab title and status line update every 5s with server status and
+The Ghostty tab title and status line update every 15s with server status and
 agent context usage (`dev-tmux-title.sh` + `dev-tmux-collect.sh`).
 
 ## `dev board` — urgency view
@@ -140,6 +140,6 @@ never clobbered.
 | `dev-session-sync.sh` | OneDrive manifest + Claude transcript sync, restore picker |
 | `dev-setup.sh` | one-time machine setup (DNS, docker network, traefik) |
 | `dev-tmux-agent-launch.sh` | launches the agent pane; resumes Claude by session uuid |
-| `dev-tmux-title.sh` | Ghostty tab title / status line updater (5s poll) |
+| `dev-tmux-title.sh` | Ghostty tab title / status line updater (15s poll) |
 | `dev-tmux-collect.sh` | gathers agent/server state as JSON for the title script |
 | `dev-wait-pnpm.sh` | build pane gate: wait for background pnpm install |
