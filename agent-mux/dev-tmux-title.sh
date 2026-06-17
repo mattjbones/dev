@@ -219,11 +219,13 @@ if [ "$STATE_PUSH" = true ]; then
   printf '%s\n%s' "$IMPORTANT_SIG" "$STATE_SIG" > "$SIG_FILE" 2>/dev/null || true
 fi
 
-# --- Periodic sidebar re-sort (local-only, no network) ---
-# Any session may trigger it, but an atomic mkdir lock + a timestamp keep it to once
-# per DEV_BOARD_REFLECT_INTERVAL across all sessions. The reflect runs in the background
-# so it never delays the status line.
-# The sidebar re-sort only matters under cmux; skip the work entirely otherwise.
+# --- Periodic data refresh + sidebar re-sort ---
+# Any focused session triggers it; an atomic mkdir lock + a timestamp keep it to once per
+# DEV_BOARD_REFLECT_INTERVAL across all sessions, in the background so it never delays the
+# status line. This only fires while a session is focused (you're present), so it's safe to
+# refresh the PR/Linear cache here too (TTL-gated inside the collector) — otherwise the board
+# only reflected local agent-state and went stale on PR/review movement until the next manual
+# `dev board`/attach. Only matters under cmux.
 __CMUX_BIN="$(command -v cmux 2>/dev/null || echo /Applications/cmux.app/Contents/Resources/bin/cmux)"
 if [ -x "$__CMUX_BIN" ]; then
   BOARD_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -231,12 +233,15 @@ if [ -x "$__CMUX_BIN" ]; then
   REFLECT_STAMP="/tmp/dev-board/last-reflect"
   REFLECT_LOCK="/tmp/dev-board/reflect.lock"
   mkdir -p /tmp/dev-board 2>/dev/null || true
+  # Drop a stale lock left by a refresh that died before releasing it.
+  [ -n "$(find "$REFLECT_LOCK" -mmin +5 2>/dev/null)" ] && rmdir "$REFLECT_LOCK" 2>/dev/null
   REFLECT_NOW="$(date +%s)"
   REFLECT_M="$(stat -f %m "$REFLECT_STAMP" 2>/dev/null || echo 0)"
   if [ "$(( REFLECT_NOW - REFLECT_M ))" -ge "$REFLECT_INTERVAL" ]; then
     if mkdir "$REFLECT_LOCK" 2>/dev/null; then
       touch "$REFLECT_STAMP" 2>/dev/null || true
-      ( "$BOARD_DIR/dev-board.sh" --reflect >/dev/null 2>&1; rmdir "$REFLECT_LOCK" 2>/dev/null || true ) &
+      # Refresh PR/Linear data (TTL-gated, network) THEN re-rank + reorder cmux.
+      ( "$BOARD_DIR/dev-board-collect.sh" >/dev/null 2>&1; "$BOARD_DIR/dev-board.sh" --reflect >/dev/null 2>&1; rmdir "$REFLECT_LOCK" 2>/dev/null || true ) &
     fi
   fi
 fi
