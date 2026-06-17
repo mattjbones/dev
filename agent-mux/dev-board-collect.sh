@@ -28,7 +28,7 @@ if [ "$STDIN" -eq 1 ]; then
 else
   # Enumerate this host's active dev sessions from the manifest (machine-readable).
   # Remote-host sessions are excluded: they have no local tmux pane or cmux workspace.
-  host="$(hostname -s 2>/dev/null || echo unknown)"
+  host="$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/{print $4; exit}')"; [ -n "$host" ] || host="$(hostname -s 2>/dev/null || echo unknown)"
   WL="$("$DIR/dev-session-sync.sh" list --json 2>/dev/null \
         | jq --arg h "$host" '[.[] | select(.status == "active" and .host == $h)
             | {key: .session, branch: .branch, worktree: .worktree}]' 2>/dev/null || echo '[]')"
