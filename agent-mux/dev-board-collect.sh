@@ -93,10 +93,10 @@ MERGED="$(printf '%s' "$WL2" | jq --argjson snap "$SNAP" '
           linearStateType: ($s.linearStateType // null),
           pr: ($s.pr // null),
           reviewState: (
-            # Ready to Merge = a human has APPROVED it (open, non-draft) and it isn't conflicted.
-            # We intentionally do NOT require mergeStateStatus == CLEAN: Graphite stacks and
-            # pending/non-required checks report BLOCKED/UNSTABLE even on approved PRs, which
-            # would otherwise hide them. Approval is the "good to merge" signal here.
+            # Ready to Merge = a human has APPROVED it (open, non-draft) and it is not in
+            # conflict. We intentionally do NOT require mergeStateStatus == CLEAN: Graphite
+            # stacks and pending/non-required checks report BLOCKED/UNSTABLE even on approved
+            # PRs, which would otherwise hide them. Approval is the good-to-merge signal here.
             if (($s.pr.state // "") == "OPEN" and ($s.pr.isDraft // false) == false
                 and ($s.pr.reviewDecision // "") == "APPROVED"
                 and ($s.pr.mergeStateStatus // "") != "DIRTY")
