@@ -198,10 +198,16 @@ if [ "$STATE_PUSH" = true ]; then
 
   # Mirror the same state into cmux when available.
   if cmux_available; then
-    cmux_run rename-workspace "$WORKSPACE_TITLE" || true
-
+    # NOTE: we intentionally do NOT rename the workspace. cmux owns the name (its ticket
+    # title + live agent status); our rename fought cmux's and the docker glyph flickered.
+    # Server/docker state is shown via the build status pill below, which cmux never overwrites.
     cmux_run set-status agent "${AGENT_PANE_TITLE#${AGENT_ICON} }" --icon sparkle --color "#34c759" || true
-    cmux_run set-status build "$BUILD_STATUS_VALUE" --icon shippingbox --color "#0a84ff" || true
+    case "$BUILD_STATUS_VALUE" in
+      docker)    cmux_run set-status build "🐳 docker" --icon shippingbox --color "#0a84ff" || true ;;
+      server)    cmux_run set-status build "🏃 server" --icon shippingbox --color "#0a84ff" || true ;;
+      storybook) cmux_run set-status build "📖 storybook" --icon shippingbox --color "#0a84ff" || true ;;
+      *)         cmux_run clear-status build || true ;;
+    esac
 
     if [ -n "$CONTEXT_STATUS_VALUE" ]; then
       cmux_run set-status context "$CONTEXT_STATUS_VALUE" --icon gauge --color "#ff9f0a" || true
