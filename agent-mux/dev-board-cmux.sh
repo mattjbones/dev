@@ -116,16 +116,17 @@ main() {
     fi
   done
 
-  # Realize the order: first item to top, then chain each after the previous.
-  local prev="" first=1 ref
+  # Realize the order with move-top applied in REVERSE, so the first item ends on top.
+  # We use ONLY move-top (reliable: moves to the top of the unpinned zone). The previous
+  # `reorder --after` chain produced rotated orders. Unpin each item first so a leftover
+  # pin can't float a workspace above its section (and break the ordering).
+  local ref revseq=""
   for ref in $seq; do
-    if [ "$first" = "1" ]; then
-      "$CMUX_BIN" workspace-action --workspace "$ref" --action move-top >/dev/null 2>&1 || true
-      first=0
-    else
-      "$CMUX_BIN" reorder-workspace --workspace "$ref" --after "$prev" >/dev/null 2>&1 || true
-    fi
-    prev="$ref"
+    "$CMUX_BIN" workspace-action --workspace "$ref" --action unpin >/dev/null 2>&1 || true
+    revseq="$ref${revseq:+ }$revseq"
+  done
+  for ref in $revseq; do
+    "$CMUX_BIN" workspace-action --workspace "$ref" --action move-top >/dev/null 2>&1 || true
   done
 }
 main
