@@ -11,7 +11,7 @@ CMUX_BIN="${CMUX_BIN:-$(command -v cmux 2>/dev/null || echo /Applications/cmux.a
 header_def() {
   case "$1" in
     1) echo "🔴 Act Now|Red" ;;
-    2) echo "🟢 Ready to Merge|Green" ;;
+    2) echo "🟢 Approved|Green" ;;
     3) echo "🔵 Waiting for Review|Blue" ;;
     4) echo "🟠 Needs You|Orange" ;;
     5) echo "🟡 In Progress|Amber" ;;
@@ -23,7 +23,7 @@ header_def() {
 header_desc() {
   case "$1" in
     1) echo "Urgent (P1) in Linear — drop everything" ;;
-    2) echo "Approved — good to merge" ;;
+    2) echo "Approved — your move (merge / ship)" ;;
     3) echo "Open PR awaiting review" ;;
     4) echo "Agent blocked — needs your input" ;;
     5) echo "Agent working, or mid-priority WIP" ;;
