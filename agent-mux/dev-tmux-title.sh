@@ -202,10 +202,11 @@ if [ "$STATE_PUSH" = true ]; then
     # title + live agent status); our rename fought cmux's and the docker glyph flickered.
     # Server/docker state is shown via the build status pill below, which cmux never overwrites.
     cmux_run set-status agent "${AGENT_PANE_TITLE#${AGENT_ICON} }" --icon sparkle --color "#34c759" || true
+    # Emoji in the label already conveys the kind, so no --icon (avoids a redundant glyph).
     case "$BUILD_STATUS_VALUE" in
-      docker)    cmux_run set-status build "🐳 docker" --icon shippingbox --color "#0a84ff" || true ;;
-      server)    cmux_run set-status build "🏃 server" --icon shippingbox --color "#0a84ff" || true ;;
-      storybook) cmux_run set-status build "📖 storybook" --icon shippingbox --color "#0a84ff" || true ;;
+      docker)    cmux_run set-status build "🐳 docker" --color "#0a84ff" || true ;;
+      server)    cmux_run set-status build "🏃 server" --color "#0a84ff" || true ;;
+      storybook) cmux_run set-status build "📖 storybook" --color "#0a84ff" || true ;;
       *)         cmux_run clear-status build || true ;;
     esac
 
