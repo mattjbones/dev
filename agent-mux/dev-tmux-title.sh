@@ -162,21 +162,31 @@ WORKSPACE_TITLE="$(printf '%s' "$WORKSPACE_TITLE" | sed 's/^ *//;s/  */ /g')"
 STATE_JITTER=$(( $(printf '%s' "$WORKSPACE_NAME" | cksum | cut -d' ' -f1) % 15 ))
 STATE_MIN_INTERVAL=$(( 30 + STATE_JITTER ))
 STATE_TTL=60
+# IMPORTANT = structural state that should reflect immediately (docker/server/build icon,
+# build status, agent pane title). Full sig adds the noisy bits (token %, claude status)
+# that we rate-limit to avoid flooding cmux.
+IMPORTANT_SIG="${SERVER_ICON}|${BUILD_STATUS_VALUE}|${BUILD_PANE_TITLE}|${AGENT_PANE_TITLE}"
 STATE_SIG="${WORKSPACE_TITLE}|${AGENT_PANE_TITLE}|${BUILD_PANE_TITLE}|${BUILD_STATUS_VALUE}|${CONTEXT_STATUS_VALUE}|${PERCENT}"
 SIG_FILE="/tmp/dev-tmux-title/${WORKSPACE_NAME}-state-sig"
 mkdir -p /tmp/dev-tmux-title 2>/dev/null
 
-STATE_CACHED=""
-[ -f "$SIG_FILE" ] && STATE_CACHED="$(cat "$SIG_FILE" 2>/dev/null)"
+STATE_CACHED_IMP=""; STATE_CACHED_FULL=""
+if [ -f "$SIG_FILE" ]; then
+  STATE_CACHED_IMP="$(sed -n '1p' "$SIG_FILE" 2>/dev/null)"
+  STATE_CACHED_FULL="$(sed -n '2p' "$SIG_FILE" 2>/dev/null)"
+fi
 STATE_MTIME="$(stat -f %m "$SIG_FILE" 2>/dev/null || echo 0)"
 STATE_ELAPSED=$(( $(date +%s) - STATE_MTIME ))
 
 STATE_PUSH=false
-if [ "$STATE_CACHED" != "$STATE_SIG" ]; then
-  # Changed - push, but no more often than once per STATE_MIN_INTERVAL per workspace.
+if [ "$STATE_CACHED_IMP" != "$IMPORTANT_SIG" ]; then
+  # Structural change (e.g. docker started/stopped) -> reflect immediately, no rate-limit.
+  STATE_PUSH=true
+elif [ "$STATE_CACHED_FULL" != "$STATE_SIG" ]; then
+  # Only the noisy bits changed (token %, status) -> rate-limit.
   [ "$STATE_ELAPSED" -ge "$STATE_MIN_INTERVAL" ] && STATE_PUSH=true
 else
-  # Unchanged - re-push only after the TTL so titles/cmux self-heal after a restart.
+  # Nothing changed -> re-push after the TTL so cmux self-heals after a restart.
   [ "$STATE_ELAPSED" -ge "$STATE_TTL" ] && STATE_PUSH=true
 fi
 
@@ -206,5 +216,58 @@ if [ "$STATE_PUSH" = true ]; then
     fi
   fi
 
-  printf '%s' "$STATE_SIG" > "$SIG_FILE" 2>/dev/null || true
+  printf '%s\n%s' "$IMPORTANT_SIG" "$STATE_SIG" > "$SIG_FILE" 2>/dev/null || true
+fi
+
+# --- Periodic sidebar re-sort (local-only, no network) ---
+# Any session may trigger it, but an atomic mkdir lock + a timestamp keep it to once
+# per DEV_BOARD_REFLECT_INTERVAL across all sessions. The reflect runs in the background
+# so it never delays the status line.
+# The sidebar re-sort only matters under cmux; skip the work entirely otherwise.
+__CMUX_BIN="$(command -v cmux 2>/dev/null || echo /Applications/cmux.app/Contents/Resources/bin/cmux)"
+if [ -x "$__CMUX_BIN" ]; then
+  BOARD_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+  REFLECT_INTERVAL="${DEV_BOARD_REFLECT_INTERVAL:-300}"
+  REFLECT_STAMP="/tmp/dev-board/last-reflect"
+  REFLECT_LOCK="/tmp/dev-board/reflect.lock"
+  mkdir -p /tmp/dev-board 2>/dev/null || true
+  REFLECT_NOW="$(date +%s)"
+  REFLECT_M="$(stat -f %m "$REFLECT_STAMP" 2>/dev/null || echo 0)"
+  if [ "$(( REFLECT_NOW - REFLECT_M ))" -ge "$REFLECT_INTERVAL" ]; then
+    if mkdir "$REFLECT_LOCK" 2>/dev/null; then
+      touch "$REFLECT_STAMP" 2>/dev/null || true
+      ( "$BOARD_DIR/dev-board.sh" --reflect >/dev/null 2>&1; rmdir "$REFLECT_LOCK" 2>/dev/null || true ) &
+    fi
+  fi
+fi
+
+# --- Refresh titles for backgrounded (0-client) workspaces ---
+# cmux only attaches a tmux client to a workspace it has opened, so never-opened/backgrounded
+# sessions never run their own status-right and their sidebar titles freeze. Any polling
+# session sweeps them, throttled to once per DEV_TITLE_SWEEP_INTERVAL across all sessions
+# (atomic mkdir lock + timestamp). Only relevant under cmux (many backgrounded surfaces).
+if [ -x "$__CMUX_BIN" ]; then
+  SWEEP_INTERVAL="${DEV_TITLE_SWEEP_INTERVAL:-30}"
+  SWEEP_STAMP="/tmp/dev-tmux-title/.title-sweep"
+  SWEEP_LOCK="/tmp/dev-tmux-title/.title-sweep.lock"
+  mkdir -p /tmp/dev-tmux-title 2>/dev/null || true
+  # Drop a stale lock left by a sweep that died before releasing it.
+  [ -n "$(find "$SWEEP_LOCK" -mmin +2 2>/dev/null)" ] && rmdir "$SWEEP_LOCK" 2>/dev/null
+  SWEEP_NOW="$(date +%s)"
+  SWEEP_M="$(stat -f %m "$SWEEP_STAMP" 2>/dev/null || echo 0)"
+  if [ "$(( SWEEP_NOW - SWEEP_M ))" -ge "$SWEEP_INTERVAL" ] && mkdir "$SWEEP_LOCK" 2>/dev/null; then
+    touch "$SWEEP_STAMP" 2>/dev/null || true
+    (
+      for __s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
+        # Skip sessions that poll themselves (they have an attached tmux client).
+        [ "$(tmux list-clients -t "$__s" 2>/dev/null | wc -l | tr -d ' ')" -eq 0 ] || continue
+        __sr="$(tmux show-options -t "$__s" -v status-right 2>/dev/null)"
+        case "$__sr" in *dev-tmux-title.sh*) ;; *) continue ;; esac
+        # Recover the title invocation from "#(<cmd>)  %H:%M" and re-run it.
+        __cmd="${__sr#*#(}"; __cmd="${__cmd%")  %H:%M"}"
+        [ -n "$__cmd" ] && eval "$__cmd" >/dev/null 2>&1
+      done
+      rmdir "$SWEEP_LOCK" 2>/dev/null || true
+    ) &
+  fi
 fi

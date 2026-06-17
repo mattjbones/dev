@@ -178,6 +178,11 @@ cmd_reconcile() {
 
 cmd_list() {
   ensure_base || return 0
+  if [ "${1:-}" = "--json" ]; then
+    # Machine-readable merged view (all hosts). Consumers filter as needed.
+    cat "$ONEDRIVE_BASE"/*.json 2>/dev/null | jq -s 'add // [] | sort_by(.status, .session)'
+    return
+  fi
   {
     echo "SESSION|HOST|STATUS|MODEL|UPDATED|BRANCH"
     cat "$ONEDRIVE_BASE"/*.json 2>/dev/null | jq -r -s \
@@ -319,7 +324,7 @@ cmd_restore() {
 case "${1:-}" in
   record)    shift; cmd_record "$@" ;;
   reconcile) shift; cmd_reconcile ;;
-  list)      shift; cmd_list ;;
+  list)      shift; cmd_list "$@" ;;
   restore)   shift; cmd_restore "$@" ;;
   push)      shift; cmd_push ;;
   sync)      shift; cmd_sync ;;

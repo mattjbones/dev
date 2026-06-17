@@ -60,8 +60,35 @@ Inside the session — prefix is **Ctrl-a** (Ctrl-b is captured by Claude Code):
 | `Ctrl-a m` | toggle mouse mode |
 | mouse | click panes, drag borders (on by default) |
 
-The Ghostty tab title and status line update every 5s with server status and
+The Ghostty tab title and status line update every 15s with server status and
 agent context usage (`dev-tmux-title.sh` + `dev-tmux-collect.sh`).
+
+## `dev board` — urgency view
+
+`dev board` opens an fzf picker of all your active workspaces ranked by urgency;
+`enter` attaches to the selected one. It works in any terminal.
+
+Five tiers, most urgent first:
+
+| Tier | Meaning |
+| --- | --- |
+| 🔴 Act Now | High-priority Linear ticket that also needs action (open PR or agent blocked) |
+| 🔵 Waiting for Review | Idle with an open (non-draft) PR, or Linear status "In Review" |
+| 🟠 Needs You | Agent blocked, waiting on your input |
+| 🟢 In Progress | Agent actively working, or Medium+ priority work sitting idle |
+| ⚪ Parked | Low/None priority, idle |
+
+Signals: **priority** comes from the workspace's Linear ticket — taken from the
+workspace name, falling back to the live git branch; **review state** from the
+live branch's PR (via `gh`) or Linear "In Review"; **attention**
+(working/blocked/idle) from the agent pane. An actively-working agent counts as
+In Progress even if it has an open PR.
+
+Under **cmux**, the sidebar is also reorganised into five pinned header
+workspaces matching the tiers — re-sorted on `dev board`, on attach, and every
+~5 minutes (local-only; no extra network). Outside cmux the sidebar reflection
+is skipped; the picker still works everywhere. Data is cached in
+`/tmp/dev-board/cache.json` (TTL 180s); `dev board --refresh` forces a refetch.
 
 ## Workspace management — `dev ctl`
 
@@ -128,6 +155,6 @@ never clobbered.
 | `dev-session-sync.sh` | OneDrive manifest + Claude transcript sync, restore picker |
 | `dev-setup.sh` | one-time machine setup (DNS, docker network, traefik) |
 | `dev-tmux-agent-launch.sh` | launches the agent pane; resumes Claude by session uuid |
-| `dev-tmux-title.sh` | Ghostty tab title / status line updater (5s poll) |
+| `dev-tmux-title.sh` | Ghostty tab title / status line updater (15s poll) |
 | `dev-tmux-collect.sh` | gathers agent/server state as JSON for the title script |
 | `dev-wait-pnpm.sh` | build pane gate: wait for background pnpm install |

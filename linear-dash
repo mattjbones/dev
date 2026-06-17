@@ -67,7 +67,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 // ---------- args ----------
 function parseArgs(argv) {
-  const args = { project: null, repo: DEFAULT_REPO, watch: null, all: false, showCancelled: false };
+  const args = { project: null, repo: DEFAULT_REPO, watch: null, all: false, showCancelled: false, json: false, branches: [] };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--repo') {
@@ -89,6 +89,10 @@ function parseArgs(argv) {
       console.log('  --watch keys: j/k move · h/l section · Ctrl-d/u half-page · g/G ends');
       console.log('                / search · n/N next match · ↵ details · m extras · q quit');
       process.exit(0);
+    } else if (a === '--json') {
+      args.json = true;
+    } else if (a === '--branches') {
+      args.branches = (argv[++i] || '').split(',').map((s) => s.trim()).filter(Boolean);
     } else {
       args.project = a;
     }
@@ -633,6 +637,70 @@ async function fetchLinearIssuesByIds(ids) {
     // enrichment only — sections still render without Linear
   }
   return byId;
+}
+
+// Machine-readable per-branch ticket+PR snapshot for the dev urgency board.
+// Input: branch names. Output (stdout): JSON array, no ANSI, safe to pipe.
+async function emitBoardJson(branches) {
+  const PRIORITY_LABEL = { 0: null, 1: 'Urgent', 2: 'High', 3: 'Medium', 4: 'Low' };
+
+  // Each entry may be:
+  //   "branch"            — plain; ticket derived from branch name
+  //   "branch|ticket"     — explicit ticket, PR looked up by branch
+  //   "branch|ticket|pr"  — explicit ticket AND explicit PR number; gh pr view <pr> used instead of branch
+  // Split on '|' into up to 3 parts.
+  const entries = branches.map((raw) => {
+    const parts = raw.split('|');
+    const branch = parts[0];
+    const rawTicket = parts[1]?.trim() ?? '';
+    const rawPr = parts[2]?.trim() ?? '';
+
+    let ticket;
+    if (rawTicket) {
+      ticket = rawTicket;
+    } else {
+      const m = branch.toLowerCase().match(/([a-z]{2,7})-(\d{2,6})/);
+      ticket = m ? `${m[1].toUpperCase()}-${m[2]}` : null;
+    }
+
+    // prRef: if a PR number is explicitly provided, use it for gh pr view; else use the branch.
+    const prRef = rawPr || null;
+    return { branch, ticket, prRef };
+  });
+
+  const ids = [...new Set(entries.map((e) => e.ticket).filter(Boolean))];
+  const linear = await fetchLinearIssuesByIds(ids);
+
+  const out = [];
+  for (const { branch, ticket, prRef } of entries) {
+    const issue = ticket ? linear.get(ticket) : null;
+    let pr = null;
+    // Use explicit PR number if provided, otherwise look up by branch name.
+    const ghRef = prRef ?? branch;
+    try {
+      const { stdout } = await execFileP('gh', ['pr', 'view', ghRef, '--repo', ARGS.repo, '--json', PR_JSON_FIELDS]);
+      const p = JSON.parse(stdout);
+      pr = { number: p.number, state: p.state, isDraft: p.isDraft, reviewDecision: p.reviewDecision, mergeStateStatus: p.mergeStateStatus };
+    } catch (err) {
+      pr = null;
+      // "no PR for this branch" is the normal case (gh exits non-zero); only warn on
+      // anything that doesn't look like that, so auth/network failures stay visible.
+      const stderr = String(err?.stderr ?? '');
+      if (stderr && !/no (open )?pull requests? found/i.test(stderr)) {
+        process.stderr.write(`linear-dash --json: gh pr view ${ghRef} failed: ${stderr.trim().split('\n')[0]}\n`);
+      }
+    }
+    out.push({
+      branch,
+      ticket,
+      priority: issue ? issue.priority : 0,
+      priorityLabel: issue ? PRIORITY_LABEL[issue.priority] : null,
+      linearState: issue?.state?.name ?? null,
+      linearStateType: issue?.state?.type ?? null,
+      pr,
+    });
+  }
+  process.stdout.write(JSON.stringify(out) + '\n');
 }
 
 // ---------- details page data (lazy, on Enter) ----------
@@ -1290,7 +1358,12 @@ async function compute() {
 const buildItems = (data) => render(data.project, data.rows, data.sourceLabel, data.extras, data.now);
 const flatten = (items) => items.map((i) => i.text).join('\n');
 
-if (ARGS.watch != null) {
+if (ARGS.json) {
+  emitBoardJson(ARGS.branches).catch((err) => {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  });
+} else if (ARGS.watch != null) {
   const interval = Math.max(10, ARGS.watch) * 1000;
   const onTty = Boolean(process.stdout.isTTY);
   // Render into the alternate screen buffer (like top/less) so refreshes don't
