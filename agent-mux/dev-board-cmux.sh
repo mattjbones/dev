@@ -23,7 +23,7 @@ header_def() {
 header_desc() {
   case "$1" in
     1) echo "Urgent (P1) in Linear — drop everything" ;;
-    2) echo "Approved + green CI — just merge" ;;
+    2) echo "Approved — good to merge" ;;
     3) echo "Open PR awaiting review" ;;
     4) echo "Agent blocked — needs your input" ;;
     5) echo "Agent working, or mid-priority WIP" ;;
