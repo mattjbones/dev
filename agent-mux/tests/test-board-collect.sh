@@ -41,7 +41,9 @@ assert_eq "$(jq -r '.workspaces[0].reviewState' "$DEV_BOARD_CACHE")" "draft" "re
 assert_eq "$(jq -r '.workspaces[0].needsReview' "$DEV_BOARD_CACHE")" "false" "draft PR does not need review"
 # --- Enumeration via dev-session-sync manifest (the real, non --stdin path) ---
 FIX="$(mktemp -d)"
-host="$(hostname -s)"
+# dev-board-collect.sh keys on the stable hardware UUID (with hostname fallback);
+# build the fixture with the same identity so the host filter matches.
+host="$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/{print $4; exit}')"; [ -n "$host" ] || host="$(hostname -s)"
 cat > "$FIX/$host.json" <<EOF
 [{"session":"eng-7443","branch":"eng-7443","worktree":"/tmp/eng-7443","model":"claude","status":"active","host":"$host","updatedAt":"x"},
  {"session":"gone","branch":"gone","worktree":"/tmp/gone","model":"claude","status":"inactive","host":"$host","updatedAt":"x"}]

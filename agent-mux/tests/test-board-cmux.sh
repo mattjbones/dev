@@ -56,18 +56,18 @@ printf '%s' "$RANKED" | "$DIR/../dev-board-cmux.sh"
 # --- header creation ---
 assert_eq "$(grep -c 'new-workspace' "$LOG")" "6" "creates 6 headers when all absent"
 
-# --- never pins anything; always unpins each header ---
+# --- never pins anything; unpins headers (6) + every seq item (8) = 14 ---
 assert_eq "$(grep -c 'action pin' "$LOG" || true)" "0" "never pins"
-assert_eq "$(grep -c 'action unpin' "$LOG")" "6" "unpins each header"
+assert_eq "$(grep -c 'action unpin' "$LOG")" "14" "unpins 6 headers + all 8 seq items"
 
-# --- exactly one move-top ---
-assert_eq "$(grep -c 'action move-top' "$LOG")" "1" "exactly one move-top"
+# --- one move-top per seq item: 6 headers + 2 workspaces = 8 ---
+assert_eq "$(grep -c 'action move-top' "$LOG")" "8" "one move-top per seq item (8 items)"
 
-# --- move-top targets the Act Now header (workspace:10, first header created) ---
+# --- move-top is applied to the Act Now header (workspace:10) ---
 if grep -q 'workspace-action --workspace workspace:10 --action move-top' "$LOG"; then
   pass
 else
-  fail "move-top targets Act Now header (workspace:10)"
+  fail "move-top applied to Act Now header (workspace:10)"
 fi
 
 # --- no per-workspace coloring: clear-color count == 0 ---
@@ -79,23 +79,22 @@ assert_eq "$(grep -c 'action set-color' "$LOG")" "6" "exactly 6 set-color calls 
 # --- a description is set for each header (6 set-description calls) ---
 assert_eq "$(grep -c 'set-description' "$LOG")" "6" "a description is set for each header"
 
-# --- no literal * used in reorder calls ---
-if grep -q 'reorder-workspace --workspace \* ' "$LOG"; then
-  fail "reorder used literal * (selected-prefix bug)"
+# --- no literal * used in move-top calls (selected-prefix must be normalized) ---
+if grep -q 'workspace-action --workspace \* --action move-top' "$LOG"; then
+  fail "move-top used literal * (selected-prefix bug)"
 else
   pass
 fi
 
-# --- selected workspace reordered by real ref (workspace:1) ---
-if grep -q 'reorder-workspace --workspace workspace:1 --after' "$LOG"; then
+# --- selected workspace move-top'd by real ref (workspace:1), not * ---
+if grep -q 'workspace-action --workspace workspace:1 --action move-top' "$LOG"; then
   pass
 else
-  fail "selected workspace reordered by real ref workspace:1, not *"
+  fail "selected workspace move-top'd by real ref workspace:1, not *"
 fi
 
-# --- total reorder-workspace calls = total items - 1 = 8 - 1 = 7 ---
-# 6 headers + 2 real workspaces = 8 items; first gets move-top, remaining 7 get reorder.
-assert_eq "$(grep -c 'reorder-workspace' "$LOG")" "7" "7 reorder-workspace calls (8 items - 1)"
+# --- ordering uses move-top only; no reorder-workspace calls remain ---
+assert_eq "$(grep -c 'reorder-workspace' "$LOG" || true)" "0" "no reorder-workspace calls (move-top only)"
 
 # -----------------------------------------------------------------------
 # Test B: existing header with OLD glyph -> rename in place, not duplicated

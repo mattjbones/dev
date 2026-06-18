@@ -11,7 +11,7 @@ CMUX_BIN="${CMUX_BIN:-$(command -v cmux 2>/dev/null || echo /Applications/cmux.a
 header_def() {
   case "$1" in
     1) echo "🔴 Act Now|Red" ;;
-    2) echo "🟢 Ready to Merge|Green" ;;
+    2) echo "🟢 Approved|Green" ;;
     3) echo "🔵 Waiting for Review|Blue" ;;
     4) echo "🟠 Needs You|Orange" ;;
     5) echo "🟡 In Progress|Amber" ;;
@@ -23,7 +23,7 @@ header_def() {
 header_desc() {
   case "$1" in
     1) echo "Urgent (P1) in Linear — drop everything" ;;
-    2) echo "Approved + green CI — just merge" ;;
+    2) echo "Approved — your move (merge / ship)" ;;
     3) echo "Open PR awaiting review" ;;
     4) echo "Agent blocked — needs your input" ;;
     5) echo "Agent working, or mid-priority WIP" ;;
@@ -116,16 +116,17 @@ main() {
     fi
   done
 
-  # Realize the order: first item to top, then chain each after the previous.
-  local prev="" first=1 ref
+  # Realize the order with move-top applied in REVERSE, so the first item ends on top.
+  # We use ONLY move-top (reliable: moves to the top of the unpinned zone). The previous
+  # `reorder --after` chain produced rotated orders. Unpin each item first so a leftover
+  # pin can't float a workspace above its section (and break the ordering).
+  local ref revseq=""
   for ref in $seq; do
-    if [ "$first" = "1" ]; then
-      "$CMUX_BIN" workspace-action --workspace "$ref" --action move-top >/dev/null 2>&1 || true
-      first=0
-    else
-      "$CMUX_BIN" reorder-workspace --workspace "$ref" --after "$prev" >/dev/null 2>&1 || true
-    fi
-    prev="$ref"
+    "$CMUX_BIN" workspace-action --workspace "$ref" --action unpin >/dev/null 2>&1 || true
+    revseq="$ref${revseq:+ }$revseq"
+  done
+  for ref in $revseq; do
+    "$CMUX_BIN" workspace-action --workspace "$ref" --action move-top >/dev/null 2>&1 || true
   done
 }
 main

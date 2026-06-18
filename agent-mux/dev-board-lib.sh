@@ -21,16 +21,18 @@ priority_rank() {
 }
 
 # tier_for <priority 0..4> <reviewState merge|review|draft|none> <attention blocked|working|idle> -> 1..6
-# Act Now = Linear Urgent (1), always. Otherwise: blocked > working > ready-to-merge >
-# in-review > draft (WIP) > medium+ idle > low/none idle. Draft PRs are WIP -> In Progress.
+# Order of importance: Urgent(1) > Approved(2) > blocked->Needs You(4) > working->In Progress(5)
+# > in-review->Waiting for Review(3) > draft/mid-idle->In Progress(5) > low idle->Parked(6).
+# Approval outranks the agent's attention: an APPROVED PR is your action (go merge/ship) even
+# if the agent is also asking something. Working still beats in-review (actively progressing).
 tier_for() {
   local priority="${1:?}" review="${2:?}" attention="${3:?}"
   local low=0
   { [ "$priority" = "0" ] || [ "$priority" = "4" ]; } && low=1
   if [ "$priority" = "1" ]; then echo 1
+  elif [ "$review" = "merge" ]; then echo 2
   elif [ "$attention" = "blocked" ]; then echo 4
   elif [ "$attention" = "working" ]; then echo 5
-  elif [ "$review" = "merge" ]; then echo 2
   elif [ "$review" = "review" ]; then echo 3
   elif [ "$review" = "draft" ]; then echo 5
   elif [ "$low" = "0" ]; then echo 5

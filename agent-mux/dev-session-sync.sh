@@ -60,7 +60,14 @@ SCRIPT_DIR="$(cd -P "$(dirname "$_dss_source")" && pwd)"
 unset _dss_source _dss_dir _dss_link
 
 ONEDRIVE_BASE="${DEV_SESSION_SYNC_DIR:-$HOME/Library/CloudStorage/OneDrive-LupaPetsLtd/docs/scripts/dev-sessions}"
-HOST="$(hostname -s)"
+# Stable per-machine identity. hostname -s flaps with the network, so key on the
+# hardware UUID instead; keep a human label for display.
+machine_uuid() {
+  ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+    | awk -F'"' '/IOPlatformUUID/{print $4; exit}'
+}
+HOST="$(machine_uuid)"; [ -n "$HOST" ] || HOST="$(hostname -s)"
+HOST_LABEL="$(scutil --get ComputerName 2>/dev/null || hostname -s)"
 MANIFEST="$ONEDRIVE_BASE/$HOST.json"
 TRANSCRIPTS_DIR="$ONEDRIVE_BASE/transcripts"
 DEV_TMUX="$SCRIPT_DIR/dev.sh"
@@ -152,13 +159,13 @@ cmd_record() {
   # (reattach upserts don't know it) so a resumable chat id is never lost.
   update_manifest \
     --arg s "$session" --arg b "$branch" --arg w "$worktree" \
-    --arg m "$model" --arg h "$HOST" --arg t "$(now_utc)" \
+    --arg m "$model" --arg h "$HOST" --arg hl "$HOST_LABEL" --arg t "$(now_utc)" \
     --arg a "$agent_session" \
     '(map(select(.session == $s)) | (.[0].agentSessionId // "")) as $prev
      | [.[] | select(.session != $s)]
      + [{session: $s, branch: $b, worktree: $w, model: $m,
          agentSessionId: (if $a != "" then $a else $prev end),
-         status: "active", host: $h, updatedAt: $t}]'
+         status: "active", host: $h, hostLabel: $hl, updatedAt: $t}]'
   push_transcripts
 }
 
@@ -187,7 +194,7 @@ cmd_list() {
     echo "SESSION|HOST|STATUS|MODEL|UPDATED|BRANCH"
     cat "$ONEDRIVE_BASE"/*.json 2>/dev/null | jq -r -s \
       'add // [] | sort_by(.status, .session) | .[]
-       | [.session, .host, .status, .model, .updatedAt, (.branch // "")] | join("|")'
+       | [.session, (.hostLabel // .host), .status, .model, .updatedAt, (.branch // "")] | join("|")'
   } | column -t -s '|'
 }
 
@@ -219,7 +226,7 @@ cmd_sync() {
   done < <(cat "$ONEDRIVE_BASE"/*.json 2>/dev/null | jq -r -s --arg h "$HOST" \
     'add // [] | map(select(.status == "active" and .host != $h))
      | sort_by(.session) | .[]
-     | [.session, .host, (.branch // ""), .model, .updatedAt] | @tsv')
+     | [.session, (.hostLabel // .host), (.branch // ""), .model, .updatedAt] | @tsv')
 
   if [ -z "$avail" ]; then
     echo "Nothing to sync — no sessions active on other hosts."
@@ -321,6 +328,29 @@ cmd_restore() {
   fi
 }
 
+# adopt <old-host-name>...  — fold old (hostname-named) manifests for THIS machine into the
+# current UUID manifest: rewrite each entry's host->UUID + hostLabel, dedupe by session
+# (newest updatedAt wins), then remove the old files. Use after the hostname-flap migration.
+cmd_adopt() {
+  ensure_base || return 0
+  local uuid_file="$ONEDRIVE_BASE/$HOST.json"
+  [ -f "$uuid_file" ] || echo '[]' > "$uuid_file"
+  local old name old_file
+  for name in "$@"; do
+    old_file="$ONEDRIVE_BASE/$name.json"
+    [ -f "$old_file" ] || { echo "adopt: no manifest '$name.json'"; continue; }
+    [ "$old_file" = "$uuid_file" ] && continue
+    local tmp; tmp="$(mktemp)"
+    jq -s --arg h "$HOST" --arg hl "$HOST_LABEL" \
+      '(.[0] + .[1])
+       | map(.host=$h | .hostLabel=$hl)
+       | group_by(.session) | map(max_by(.updatedAt // ""))' \
+      "$uuid_file" "$old_file" > "$tmp" && mv "$tmp" "$uuid_file"
+    rm -f "$old_file"
+    echo "adopted '$name' into this machine ($HOST_LABEL)"
+  done
+}
+
 case "${1:-}" in
   record)    shift; cmd_record "$@" ;;
   reconcile) shift; cmd_reconcile ;;
@@ -328,6 +358,7 @@ case "${1:-}" in
   restore)   shift; cmd_restore "$@" ;;
   push)      shift; cmd_push ;;
   sync)      shift; cmd_sync ;;
+  adopt)     shift; cmd_adopt "$@" ;;
   __entry)   shift; cmd_entry "$@" ;;
   *)
     sed -n '/^# ====/,/^# ====/p' "$0" | sed 's/^# \{0,1\}//' | sed -n '3,40p'

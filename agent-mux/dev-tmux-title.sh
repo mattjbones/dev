@@ -198,19 +198,33 @@ if [ "$STATE_PUSH" = true ]; then
 
   # Mirror the same state into cmux when available.
   if cmux_available; then
-    cmux_run rename-workspace "$WORKSPACE_TITLE" || true
+    # NOTE: we intentionally do NOT rename the workspace. cmux owns the name (its ticket
+    # title + live agent status); our rename fought cmux's and the docker glyph flickered.
+    # Server/docker state is shown via the build status pill below, which cmux never overwrites.
+    # No "agent" pill: the model is ~always claude and its % duplicated the progress bar.
+    # The agent's live activity goes in the context pill (below), the % in the progress bar.
+    cmux_run clear-status agent || true
+    # Emoji in the label already conveys the kind, so no --icon (avoids a redundant glyph).
+    case "$BUILD_STATUS_VALUE" in
+      docker)    cmux_run set-status build "🐳 docker" --color "#0a84ff" || true ;;
+      server)    cmux_run set-status build "🏃 server" --color "#0a84ff" || true ;;
+      storybook) cmux_run set-status build "📖 storybook" --color "#0a84ff" || true ;;
+      *)         cmux_run clear-status build || true ;;
+    esac
 
-    cmux_run set-status agent "${AGENT_PANE_TITLE#${AGENT_ICON} }" --icon sparkle --color "#34c759" || true
-    cmux_run set-status build "$BUILD_STATUS_VALUE" --icon shippingbox --color "#0a84ff" || true
-
-    if [ -n "$CONTEXT_STATUS_VALUE" ]; then
-      cmux_run set-status context "$CONTEXT_STATUS_VALUE" --icon gauge --color "#ff9f0a" || true
+    # Keep the sidebar quiet: context usage is just the progress-bar gauge normally. Only when
+    # usage is high (>= DEV_BOARD_CONTEXT_WARN) do we add a textual warning pill, so a session
+    # only "speaks up" when it actually needs attention.
+    CONTEXT_WARN="${DEV_BOARD_CONTEXT_WARN:-70}"
+    if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]] && [ "$PERCENT" -ge "$CONTEXT_WARN" ]; then
+      cmux_run set-status context "⚠ ${PERCENT}% context" --icon gauge --color "#ff9f0a" || true
     else
       cmux_run clear-status context || true
     fi
 
+    # The gauge itself carries the level; no label, so it reads as a clean bar until it's high.
     if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]]; then
-      cmux_run set-progress "$(awk "BEGIN { printf \"%.2f\", $PERCENT / 100 }")" --label "${PERCENT}%" || true
+      cmux_run set-progress "$(awk "BEGIN { printf \"%.2f\", $PERCENT / 100 }")" || true
     else
       cmux_run clear-progress || true
     fi
@@ -219,11 +233,13 @@ if [ "$STATE_PUSH" = true ]; then
   printf '%s\n%s' "$IMPORTANT_SIG" "$STATE_SIG" > "$SIG_FILE" 2>/dev/null || true
 fi
 
-# --- Periodic sidebar re-sort (local-only, no network) ---
-# Any session may trigger it, but an atomic mkdir lock + a timestamp keep it to once
-# per DEV_BOARD_REFLECT_INTERVAL across all sessions. The reflect runs in the background
-# so it never delays the status line.
-# The sidebar re-sort only matters under cmux; skip the work entirely otherwise.
+# --- Periodic data refresh + sidebar re-sort ---
+# Any focused session triggers it; an atomic mkdir lock + a timestamp keep it to once per
+# DEV_BOARD_REFLECT_INTERVAL across all sessions, in the background so it never delays the
+# status line. This only fires while a session is focused (you're present), so it's safe to
+# refresh the PR/Linear cache here too (TTL-gated inside the collector) — otherwise the board
+# only reflected local agent-state and went stale on PR/review movement until the next manual
+# `dev board`/attach. Only matters under cmux.
 __CMUX_BIN="$(command -v cmux 2>/dev/null || echo /Applications/cmux.app/Contents/Resources/bin/cmux)"
 if [ -x "$__CMUX_BIN" ]; then
   BOARD_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -231,12 +247,15 @@ if [ -x "$__CMUX_BIN" ]; then
   REFLECT_STAMP="/tmp/dev-board/last-reflect"
   REFLECT_LOCK="/tmp/dev-board/reflect.lock"
   mkdir -p /tmp/dev-board 2>/dev/null || true
+  # Drop a stale lock left by a refresh that died before releasing it.
+  [ -n "$(find "$REFLECT_LOCK" -mmin +5 2>/dev/null)" ] && rmdir "$REFLECT_LOCK" 2>/dev/null
   REFLECT_NOW="$(date +%s)"
   REFLECT_M="$(stat -f %m "$REFLECT_STAMP" 2>/dev/null || echo 0)"
   if [ "$(( REFLECT_NOW - REFLECT_M ))" -ge "$REFLECT_INTERVAL" ]; then
     if mkdir "$REFLECT_LOCK" 2>/dev/null; then
       touch "$REFLECT_STAMP" 2>/dev/null || true
-      ( "$BOARD_DIR/dev-board.sh" --reflect >/dev/null 2>&1; rmdir "$REFLECT_LOCK" 2>/dev/null || true ) &
+      # Refresh PR/Linear data (TTL-gated, network) THEN re-rank + reorder cmux.
+      ( "$BOARD_DIR/dev-board-collect.sh" >/dev/null 2>&1; "$BOARD_DIR/dev-board.sh" --reflect >/dev/null 2>&1; rmdir "$REFLECT_LOCK" 2>/dev/null || true ) &
     fi
   fi
 fi

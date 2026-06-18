@@ -28,7 +28,7 @@ if [ "$STDIN" -eq 1 ]; then
 else
   # Enumerate this host's active dev sessions from the manifest (machine-readable).
   # Remote-host sessions are excluded: they have no local tmux pane or cmux workspace.
-  host="$(hostname -s 2>/dev/null || echo unknown)"
+  host="$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | awk -F'"' '/IOPlatformUUID/{print $4; exit}')"; [ -n "$host" ] || host="$(hostname -s 2>/dev/null || echo unknown)"
   WL="$("$DIR/dev-session-sync.sh" list --json 2>/dev/null \
         | jq --arg h "$host" '[.[] | select(.status == "active" and .host == $h)
             | {key: .session, branch: .branch, worktree: .worktree}]' 2>/dev/null || echo '[]')"
@@ -93,9 +93,13 @@ MERGED="$(printf '%s' "$WL2" | jq --argjson snap "$SNAP" '
           linearStateType: ($s.linearStateType // null),
           pr: ($s.pr // null),
           reviewState: (
+            # Ready to Merge = a human has APPROVED it (open, non-draft) and it is not in
+            # conflict. We intentionally do NOT require mergeStateStatus == CLEAN: Graphite
+            # stacks and pending/non-required checks report BLOCKED/UNSTABLE even on approved
+            # PRs, which would otherwise hide them. Approval is the good-to-merge signal here.
             if (($s.pr.state // "") == "OPEN" and ($s.pr.isDraft // false) == false
                 and ($s.pr.reviewDecision // "") == "APPROVED"
-                and ($s.pr.mergeStateStatus // "") == "CLEAN")
+                and ($s.pr.mergeStateStatus // "") != "DIRTY")
             then "merge"
             elif (($s.pr.state // "") == "OPEN" and ($s.pr.isDraft // false) == false)
             then "review"
