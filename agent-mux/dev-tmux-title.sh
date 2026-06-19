@@ -247,15 +247,20 @@ if [ -x "$__CMUX_BIN" ]; then
   REFLECT_STAMP="/tmp/dev-board/last-reflect"
   REFLECT_LOCK="/tmp/dev-board/reflect.lock"
   mkdir -p /tmp/dev-board 2>/dev/null || true
-  # Drop a stale lock left by a refresh that died before releasing it.
-  [ -n "$(find "$REFLECT_LOCK" -mmin +5 2>/dev/null)" ] && rmdir "$REFLECT_LOCK" 2>/dev/null
+  # Drop a stale lock left by a refresh that died before releasing it. Match the sweep's 2-min
+  # threshold (was 5): a leaked lock freezes the reorder until it's cleared, so heal it sooner.
+  [ -n "$(find "$REFLECT_LOCK" -mmin +2 2>/dev/null)" ] && rmdir "$REFLECT_LOCK" 2>/dev/null
   REFLECT_NOW="$(date +%s)"
   REFLECT_M="$(stat -f %m "$REFLECT_STAMP" 2>/dev/null || echo 0)"
   if [ "$(( REFLECT_NOW - REFLECT_M ))" -ge "$REFLECT_INTERVAL" ]; then
     if mkdir "$REFLECT_LOCK" 2>/dev/null; then
       touch "$REFLECT_STAMP" 2>/dev/null || true
-      # Refresh PR/Linear data (TTL-gated, network) THEN re-rank + reorder cmux.
-      ( "$BOARD_DIR/dev-board-collect.sh" >/dev/null 2>&1; "$BOARD_DIR/dev-board.sh" --reflect >/dev/null 2>&1; rmdir "$REFLECT_LOCK" 2>/dev/null || true ) &
+      # Refresh PR/Linear data (TTL-gated, network) THEN re-rank + reorder cmux. An EXIT trap
+      # releases the lock even if this backgrounded subshell is killed (e.g. the focused pane
+      # closes mid-run, SIGHUP) — otherwise a leak would block reorders until the stale sweep.
+      ( trap 'rmdir "$REFLECT_LOCK" 2>/dev/null' EXIT
+        "$BOARD_DIR/dev-board-collect.sh" >/dev/null 2>&1
+        "$BOARD_DIR/dev-board.sh" --reflect >/dev/null 2>&1 ) &
     fi
   fi
 fi
