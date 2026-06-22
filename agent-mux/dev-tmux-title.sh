@@ -213,21 +213,27 @@ if [ "$STATE_PUSH" = true ]; then
 
   # Mirror the same state into cmux when available.
   if cmux_available; then
-    # We no longer push status pills to the sidebar row — cmux owns it natively. It shows
-    # its own docker glyph and context % (its gauge pill when the agent is idle; folded
-    # into the title when active). Our old build + context pills just duplicated those —
-    # the "🐳 docker" pill sat next to cmux's own whale, the "NN%" pill next to cmux's own
-    # %. So we clear every key we used to own and let cmux be the single source.
-    #
-    # We still set the OSC window title below (set-titles-string); its SERVER_ICON is what
-    # cmux reads to fold the 🐳 + % into the active workspace title, so docker state still
-    # surfaces — just once, via cmux, instead of twice.
+    # cmux owns SOME of the sidebar row natively, but not all — so we split:
+    #   - agent kind + context %: cmux shows these itself (✳ when the agent is active, its
+    #     own context % in a gauge pill when idle / folded into the title when active). Our
+    #     old "agent" and "NN%" pills just duplicated cmux's, so we clear them and never set.
+    #   - docker/server/storybook (build): cmux has NO native awareness of these. It does not
+    #     read SERVER_ICON from the OSC window title (set-titles-string) — there is no such
+    #     feature. The sidebar whale was ONLY ever this build pill, so clearing it (as an
+    #     earlier change wrongly did, assuming cmux folded the glyph in) dropped docker state
+    #     from the sidebar entirely. We keep pushing it; it's the single source for that glyph.
     cmux_run clear-status agent || true
-    cmux_run clear-status build || true
+    # Emoji in the label already conveys the kind, so no --icon (avoids a redundant glyph).
+    case "$BUILD_STATUS_VALUE" in
+      docker)    cmux_run set-status build "🐳 docker" --color "#0a84ff" || true ;;
+      server)    cmux_run set-status build "🏃 server" --color "#0a84ff" || true ;;
+      storybook) cmux_run set-status build "📖 storybook" --color "#0a84ff" || true ;;
+      *)         cmux_run clear-status build || true ;;
+    esac
 
-    # Context % is owned by cmux (see above); we never set a context pill. CONTEXT_WARN is
-    # still used by the gauge below — a non-numeric bar that flags a near-full session, so
-    # it doesn't collide with cmux's %.
+    # Context % is owned by cmux (it reads Claude Code directly); we never set a context pill.
+    # CONTEXT_WARN is still used by the gauge below — a non-numeric bar that flags a near-full
+    # session, so it doesn't collide with cmux's %.
     CONTEXT_WARN="${DEV_BOARD_CONTEXT_WARN:-70}"
     cmux_run clear-status context || true
 
