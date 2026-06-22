@@ -28,11 +28,14 @@ set -euo pipefail
 #   ./dev-session-sync.sh list
 #       Merged view of all hosts' manifests.
 #
-#   ./dev-session-sync.sh restore [--all | <session>...]
-#       Recreate sessions recorded as active on ANOTHER host (and not already
-#       running here) via dev.sh in no-attach mode. --all restores every such
-#       session; otherwise pass session names. Pulls the recorded Claude chat
-#       transcript from OneDrive first so the agent pane resumes the chat.
+#   ./dev-session-sync.sh restore [--all | --here | <session>...]
+#       Recreate sessions recorded as active (and not already running here) via
+#       dev.sh in no-attach mode, resuming each agent's Claude chat.
+#         --all   every session active on ANOTHER host (cross-machine restore).
+#         --here  every session active on THIS host that isn't running — i.e.
+#                 crash recovery after the tmux server dies (the manifest still
+#                 marks them active until the next reconcile).
+#         <session>...  restore named sessions (defaults to the other-host scope).
 #
 #   ./dev-session-sync.sh push
 #       Copy local Claude transcripts for recorded sessions to OneDrive
@@ -282,28 +285,44 @@ cmd_restore() {
     return 1
   fi
 
-  local all=false
-  if [ "${1:-}" = "--all" ]; then
-    all=true
-    shift
-  fi
+  local all=false here=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)  all=true;  shift ;;
+      --here) here=true; shift ;;
+      --)     shift; break ;;
+      -*)     echo "dev-session-sync restore: unknown flag '$1'" >&2; return 1 ;;
+      *)      break ;;
+    esac
+  done
+  # --here recovers THIS host's OWN sessions — e.g. after a tmux server crash, when
+  # the sessions vanished but reconcile hasn't run yet so the manifest still marks
+  # them active. Default (no --here) is the cross-machine case: sessions active on
+  # OTHER hosts. Either scope skips anything already running here. --here implies
+  # "restore them all" (you don't enumerate ~40 crashed sessions by hand).
+  local select_all=false
+  { $all || $here; } && select_all=true
 
-  # Candidates: active on another host, not currently running on this one.
+  local host_match scope
+  if $here; then host_match='.host == $h'; scope="this host"
+  else           host_match='.host != $h'; scope="other hosts"; fi
+
+  # Candidates: active in the chosen scope, not currently running on this machine.
   local candidates
   candidates="$(cat "$ONEDRIVE_BASE"/*.json 2>/dev/null | jq -r -s --arg h "$HOST" \
-    'add // [] | map(select(.status == "active" and .host != $h))
+    'add // [] | map(select(.status == "active" and ('"$host_match"')))
      | sort_by(.session) | .[]
      | [.session, (.branch // ""), .model, (.agentSessionId // ""), (.worktree // "")] | @tsv')"
 
   if [ -z "$candidates" ]; then
-    echo "No sessions active on other hosts."
+    echo "No sessions recorded active on $scope."
     return 0
   fi
 
   local restored=0
   while IFS=$'\t' read -r session branch model agent_session worktree; do
     [ -z "$session" ] && continue
-    if ! $all; then
+    if ! $select_all; then
       case " $* " in
         *" $session "*) ;;
         *) continue ;;
@@ -331,10 +350,10 @@ cmd_restore() {
     restored=$((restored + 1))
   done <<< "$candidates"
 
-  if [ "$restored" -eq 0 ] && ! $all; then
-    echo "Nothing restored. Candidates active elsewhere:"
+  if [ "$restored" -eq 0 ] && ! $select_all; then
+    echo "Nothing restored. Candidates active on $scope:"
     echo "$candidates" | cut -f1 | sed 's/^/  /'
-    echo "Run with --all or pass session names."
+    echo "Run with --all (other hosts), --here (this host, e.g. after a crash), or pass session names."
   else
     echo "Restored $restored session(s). Attach with: dev <branch>  or  dev ctl"
   fi
