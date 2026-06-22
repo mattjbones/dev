@@ -227,9 +227,10 @@ if [ "$STATE_PUSH" = true ]; then
       *)         cmux_run clear-status build || true ;;
     esac
 
-    # Keep the sidebar quiet: context usage is just the progress-bar gauge normally. Only when
-    # usage is high (>= DEV_BOARD_CONTEXT_WARN) do we add a textual warning pill, so a session
-    # only "speaks up" when it actually needs attention.
+    # Keep the sidebar quiet: a session shows NOTHING about context until usage is high
+    # (>= DEV_BOARD_CONTEXT_WARN) — then it gets both a textual ⚠ pill and the progress
+    # gauge below. Low-usage sessions stay bare (just the name), so the sidebar only
+    # "speaks up" for sessions that actually need attention.
     CONTEXT_WARN="${DEV_BOARD_CONTEXT_WARN:-70}"
     if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]] && [ "$PERCENT" -ge "$CONTEXT_WARN" ]; then
       cmux_run set-status context "⚠ ${PERCENT}% context" --icon gauge --color "#ff9f0a" || true
@@ -237,8 +238,10 @@ if [ "$STATE_PUSH" = true ]; then
       cmux_run clear-status context || true
     fi
 
-    # The gauge itself carries the level; no label, so it reads as a clean bar until it's high.
-    if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]]; then
+    # Only surface the gauge when usage is high (>= DEV_BOARD_CONTEXT_WARN); below that the
+    # row stays bare (just the name) so only attention-worthy sessions show a bar. No label
+    # either — the bar itself carries the level, and the ⚠ context pill above states the %.
+    if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]] && [ "$PERCENT" -ge "$CONTEXT_WARN" ]; then
       cmux_run set-progress "$(awk "BEGIN { printf \"%.2f\", $PERCENT / 100 }")" || true
     else
       cmux_run clear-progress || true
