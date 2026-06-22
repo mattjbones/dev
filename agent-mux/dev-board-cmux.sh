@@ -61,6 +61,11 @@ ref_for_label() {
 header_ref_set() { eval "HEADER_REF_${1}=${2}"; }
 header_ref_get() { eval "printf '%s' \"\${HEADER_REF_${1}:-}\""; }
 
+# Extract the "workspace:N" ref token from new-workspace output (e.g. "OK workspace:30").
+ref_from_create() {
+  awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^workspace:/) { print $i; exit } }'
+}
+
 # Ensure each header exists + is unpinned + colored. Populate HEADER_REF_N vars.
 # Matches by stable text label so glyph/color changes rename in place (no orphans).
 ensure_headers() {
@@ -70,13 +75,16 @@ ensure_headers() {
     label="$(header_label "$tier")"
     ref="$(ref_for_label "$label")"
     if [ -z "$ref" ]; then
-      "$CMUX_BIN" new-workspace --name "$title" >/dev/null 2>&1 || true
-      ref="$(ref_for_label "$label")"
-    else
-      # heal glyph/color drift in place (no orphaned duplicate)
-      "$CMUX_BIN" workspace-action --workspace "$ref" --action rename --title "$title" >/dev/null 2>&1 || true
+      # new-workspace prints "OK workspace:N"; capture the ref directly. We can't
+      # re-find by title afterwards: --name is immediately clobbered by the shell's
+      # terminal-title escape, so matching by label would fail and we'd spawn a
+      # fresh duplicate header on every board open.
+      ref="$("$CMUX_BIN" new-workspace --name "$title" 2>/dev/null | ref_from_create)"
     fi
     [ -n "$ref" ] || continue
+    # Always rename: a manual rename sets a persistent custom name that overrides
+    # the shell's dynamic title, and heals glyph drift on existing headers in place.
+    "$CMUX_BIN" workspace-action --workspace "$ref" --action rename --title "$title" >/dev/null 2>&1 || true
     "$CMUX_BIN" workspace-action --workspace "$ref" --action unpin >/dev/null 2>&1 || true
     "$CMUX_BIN" workspace-action --workspace "$ref" --action set-color --color "$color" >/dev/null 2>&1 || true
     "$CMUX_BIN" workspace-action --workspace "$ref" --action set-description --description "$(header_desc "$tier")" >/dev/null 2>&1 || true
@@ -116,17 +124,12 @@ main() {
     fi
   done
 
-  # Realize the order with move-top applied in REVERSE, so the first item ends on top.
-  # We use ONLY move-top (reliable: moves to the top of the unpinned zone). The previous
-  # `reorder --after` chain produced rotated orders. Unpin each item first so a leftover
-  # pin can't float a workspace above its section (and break the ordering).
-  local ref revseq=""
-  for ref in $seq; do
-    "$CMUX_BIN" workspace-action --workspace "$ref" --action unpin >/dev/null 2>&1 || true
-    revseq="$ref${revseq:+ }$revseq"
-  done
-  for ref in $revseq; do
-    "$CMUX_BIN" workspace-action --workspace "$ref" --action move-top >/dev/null 2>&1 || true
-  done
+  # Realize the order in one atomic call. The chained per-item approach
+  # (move-top + reorder --after prev) drifts: a single silently-failing --after
+  # leaves "prev" stale and every later item lands in the wrong tier block.
+  # reorder-workspaces --order places the listed refs at indices 1..N together;
+  # unlisted workspaces (e.g. this very session) keep their slot above them.
+  local order="${seq# }"; order="${order// /,}"
+  [ -n "$order" ] && "$CMUX_BIN" reorder-workspaces --order "$order" >/dev/null 2>&1 || true
 }
 main

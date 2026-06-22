@@ -290,6 +290,9 @@ fi
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "Session '$SESSION' already exists, reattaching..."
   sync_session_state
+  # Ensure the shared title daemon is up (no-op if already running) - the setup
+  # block below that normally launches it is skipped on the reattach path.
+  nohup "$SCRIPT_DIR/dev-tmux-titled.sh" >/dev/null 2>&1 &
   exec tmux attach-session -t "$SESSION"
 fi
 
@@ -302,6 +305,14 @@ ensure_monorepo_deps "$WORKTREE"
 CLAUDE_SESSION_ID=""
 if [ "$MODEL" = "claude" ]; then
   CLAUDE_SESSION_ID="${DEV_CLAUDE_SESSION_ID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}"
+  # Restoring a session synced from another machine: pull its Claude transcript
+  # into the project dir for THIS machine's worktree path. Usernames differ
+  # across machines, so ~/workspace/<branch> is a different absolute path (and
+  # thus a different Claude project dir) on each — the pull must key off the
+  # local WORKTREE resolved above, which only dev.sh knows.
+  if [ -n "${DEV_CLAUDE_SESSION_ID:-}" ] && [ -x "$SESSION_SYNC_SCRIPT" ]; then
+    "$SESSION_SYNC_SCRIPT" pull "$CLAUDE_SESSION_ID" "$WORKTREE" 2>/dev/null || true
+  fi
 fi
 
 # Create session with first pane: agent
@@ -387,11 +398,23 @@ TITLE_SCRIPT="$SCRIPT_DIR/dev-tmux-title.sh"
 tmux set-option -t "$SESSION" set-titles on
 tmux set-option -t "$SESSION" set-titles-string "$AGENT_ICON $WORKSPACE_NAME"
 
-# Poll every 15 seconds to update title based on running processes and collector output.
-# The title script de-dupes cmux pushes, so a longer interval mainly affects how fast
-# server/storybook icon changes show up - 15s is plenty for that.
-tmux set-option -t "$SESSION" status-interval 15
-tmux set-option -t "$SESSION" status-right "#(${TITLE_SCRIPT} \"$SESSION\" \"$WORKSPACE_NAME\" \"$WORKTREE\" \"$MODEL\" \"$AGENT_ICON\" \"$AGENT_LABEL\")  %H:%M"
+# Title/cmux refresh is driven by a single shared background daemon
+# (dev-tmux-titled.sh), NOT by tmux re-running a #() per status redraw. Putting
+# the worker in status-right meant a streaming agent pane - which redraws the
+# status line constantly - re-spawned the worker (and its ~27 forks) far more
+# often than status-interval, across every session at once. That process storm
+# is what pegged sysmond / Defender / XProtect.
+#
+# Instead we stash the per-session worker invocation in a user option the daemon
+# reads each tick, and leave status-right as just the clock so redraws are free.
+# status-interval now only governs the clock, so 60s is ample.
+tmux set-option -t "$SESSION" @dev_title_cmd "${TITLE_SCRIPT} \"$SESSION\" \"$WORKSPACE_NAME\" \"$WORKTREE\" \"$MODEL\" \"$AGENT_ICON\" \"$AGENT_LABEL\""
+tmux set-option -t "$SESSION" status-interval 60
+tmux set-option -t "$SESSION" status-right "%H:%M"
+
+# Start the shared title daemon (no-op if one is already running). nohup so it
+# survives this shell exec'ing into `tmux attach` and the terminal detaching.
+nohup "$SCRIPT_DIR/dev-tmux-titled.sh" >/dev/null 2>&1 &
 
 # Refresh the board cache on attach/switch, in the background and only if stale
 # (dev-board-collect.sh self-gates on TTL, so this is cheap when the cache is warm).
