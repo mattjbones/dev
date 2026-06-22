@@ -46,13 +46,28 @@ SERVER_ICON=""
 # outside [a-z0-9_-] becomes '-' (collapse runs so multibyte chars like the unicode
 # hyphen in Linear-named worktrees normalise to a single '-').
 COMPOSE_PROJECT="$(printf '%s' "$WORKSPACE_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/--*/-/g')"
-if docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --filter "status=running" -q 2>/dev/null | grep -q .; then
-  SERVER_ICON=" 🐳"
-# Compose files moved into docker/ (#11882), so the working_dir label is <worktree>/docker
-elif docker ps --filter "label=com.docker.compose.project.working_dir=$WORKTREE/docker" --filter "status=running" -q 2>/dev/null | grep -q .; then
-  SERVER_ICON=" 🐳"
-elif docker ps --filter "label=com.docker.compose.project.working_dir=$WORKTREE" --filter "status=running" -q 2>/dev/null | grep -q .; then
-  SERVER_ICON=" 🐳"
+if [ "${DEV_DOCKER_PREFETCHED:-}" = "1" ]; then
+  # Driven by the daemon (dev-tmux-titled.sh): it ran one `docker ps` for the
+  # whole tick and exported the snapshot, so each worker matches against that
+  # instead of shelling out 3x. 51 docker round-trips per pass collapse to 1 -
+  # and every avoided exec is one fewer thing the (locked) Defender scanner sees.
+  # Snapshot lines are "<compose-project>|<compose-working-dir>".
+  while IFS='|' read -r _proj _wd; do
+    if [ -n "$_proj" ] && [ "$_proj" = "$COMPOSE_PROJECT" ]; then SERVER_ICON=" 🐳"; break; fi
+    # Compose files moved into docker/ (#11882), so working_dir may be <worktree>/docker.
+    if [ "$_wd" = "$WORKTREE/docker" ] || [ "$_wd" = "$WORKTREE" ]; then SERVER_ICON=" 🐳"; break; fi
+  done <<EOF
+${DEV_DOCKER_RUNNING:-}
+EOF
+else
+  # Standalone invocation (e.g. dev-ctl.sh's one-shot refresh): query directly.
+  if docker ps --filter "label=com.docker.compose.project=$COMPOSE_PROJECT" --filter "status=running" -q 2>/dev/null | grep -q .; then
+    SERVER_ICON=" 🐳"
+  elif docker ps --filter "label=com.docker.compose.project.working_dir=$WORKTREE/docker" --filter "status=running" -q 2>/dev/null | grep -q .; then
+    SERVER_ICON=" 🐳"
+  elif docker ps --filter "label=com.docker.compose.project.working_dir=$WORKTREE" --filter "status=running" -q 2>/dev/null | grep -q .; then
+    SERVER_ICON=" 🐳"
+  fi
 fi
 # Fallback: check for bun/node processes in session panes
 if [ -z "$SERVER_ICON" ]; then
@@ -212,18 +227,25 @@ if [ "$STATE_PUSH" = true ]; then
       *)         cmux_run clear-status build || true ;;
     esac
 
-    # Keep the sidebar quiet: context usage is just the progress-bar gauge normally. Only when
-    # usage is high (>= DEV_BOARD_CONTEXT_WARN) do we add a textual warning pill, so a session
+    # Always show a compact context % pill so every session's usage is glanceable. Below
+    # DEV_BOARD_CONTEXT_WARN it's a quiet grey "NN%"; at/above it escalates to an orange
+    # "⚠ NN% context" warning (and the progress gauge below also appears), so a session
     # only "speaks up" when it actually needs attention.
     CONTEXT_WARN="${DEV_BOARD_CONTEXT_WARN:-70}"
-    if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]] && [ "$PERCENT" -ge "$CONTEXT_WARN" ]; then
-      cmux_run set-status context "⚠ ${PERCENT}% context" --icon gauge --color "#ff9f0a" || true
+    if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]]; then
+      if [ "$PERCENT" -ge "$CONTEXT_WARN" ]; then
+        cmux_run set-status context "⚠ ${PERCENT}% context" --icon gauge --color "#ff9f0a" || true
+      else
+        cmux_run set-status context "${PERCENT}%" --icon gauge --color "#8e8e93" || true
+      fi
     else
       cmux_run clear-status context || true
     fi
 
-    # The gauge itself carries the level; no label, so it reads as a clean bar until it's high.
-    if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]]; then
+    # Only surface the gauge when usage is high (>= DEV_BOARD_CONTEXT_WARN); below that the
+    # row stays bare (just the name) so only attention-worthy sessions show a bar. No label
+    # either — the bar itself carries the level, and the ⚠ context pill above states the %.
+    if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]] && [ "$PERCENT" -ge "$CONTEXT_WARN" ]; then
       cmux_run set-progress "$(awk "BEGIN { printf \"%.2f\", $PERCENT / 100 }")" || true
     else
       cmux_run clear-progress || true
@@ -233,65 +255,8 @@ if [ "$STATE_PUSH" = true ]; then
   printf '%s\n%s' "$IMPORTANT_SIG" "$STATE_SIG" > "$SIG_FILE" 2>/dev/null || true
 fi
 
-# --- Periodic data refresh + sidebar re-sort ---
-# Any focused session triggers it; an atomic mkdir lock + a timestamp keep it to once per
-# DEV_BOARD_REFLECT_INTERVAL across all sessions, in the background so it never delays the
-# status line. This only fires while a session is focused (you're present), so it's safe to
-# refresh the PR/Linear cache here too (TTL-gated inside the collector) — otherwise the board
-# only reflected local agent-state and went stale on PR/review movement until the next manual
-# `dev board`/attach. Only matters under cmux.
-__CMUX_BIN="$(command -v cmux 2>/dev/null || echo /Applications/cmux.app/Contents/Resources/bin/cmux)"
-if [ -x "$__CMUX_BIN" ]; then
-  BOARD_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-  REFLECT_INTERVAL="${DEV_BOARD_REFLECT_INTERVAL:-300}"
-  REFLECT_STAMP="/tmp/dev-board/last-reflect"
-  REFLECT_LOCK="/tmp/dev-board/reflect.lock"
-  mkdir -p /tmp/dev-board 2>/dev/null || true
-  # Drop a stale lock left by a refresh that died before releasing it. Match the sweep's 2-min
-  # threshold (was 5): a leaked lock freezes the reorder until it's cleared, so heal it sooner.
-  [ -n "$(find "$REFLECT_LOCK" -mmin +2 2>/dev/null)" ] && rmdir "$REFLECT_LOCK" 2>/dev/null
-  REFLECT_NOW="$(date +%s)"
-  REFLECT_M="$(stat -f %m "$REFLECT_STAMP" 2>/dev/null || echo 0)"
-  if [ "$(( REFLECT_NOW - REFLECT_M ))" -ge "$REFLECT_INTERVAL" ]; then
-    if mkdir "$REFLECT_LOCK" 2>/dev/null; then
-      touch "$REFLECT_STAMP" 2>/dev/null || true
-      # Refresh PR/Linear data (TTL-gated, network) THEN re-rank + reorder cmux. An EXIT trap
-      # releases the lock even if this backgrounded subshell is killed (e.g. the focused pane
-      # closes mid-run, SIGHUP) — otherwise a leak would block reorders until the stale sweep.
-      ( trap 'rmdir "$REFLECT_LOCK" 2>/dev/null' EXIT
-        "$BOARD_DIR/dev-board-collect.sh" >/dev/null 2>&1
-        "$BOARD_DIR/dev-board.sh" --reflect >/dev/null 2>&1 ) &
-    fi
-  fi
-fi
-
-# --- Refresh titles for backgrounded (0-client) workspaces ---
-# cmux only attaches a tmux client to a workspace it has opened, so never-opened/backgrounded
-# sessions never run their own status-right and their sidebar titles freeze. Any polling
-# session sweeps them, throttled to once per DEV_TITLE_SWEEP_INTERVAL across all sessions
-# (atomic mkdir lock + timestamp). Only relevant under cmux (many backgrounded surfaces).
-if [ -x "$__CMUX_BIN" ]; then
-  SWEEP_INTERVAL="${DEV_TITLE_SWEEP_INTERVAL:-30}"
-  SWEEP_STAMP="/tmp/dev-tmux-title/.title-sweep"
-  SWEEP_LOCK="/tmp/dev-tmux-title/.title-sweep.lock"
-  mkdir -p /tmp/dev-tmux-title 2>/dev/null || true
-  # Drop a stale lock left by a sweep that died before releasing it.
-  [ -n "$(find "$SWEEP_LOCK" -mmin +2 2>/dev/null)" ] && rmdir "$SWEEP_LOCK" 2>/dev/null
-  SWEEP_NOW="$(date +%s)"
-  SWEEP_M="$(stat -f %m "$SWEEP_STAMP" 2>/dev/null || echo 0)"
-  if [ "$(( SWEEP_NOW - SWEEP_M ))" -ge "$SWEEP_INTERVAL" ] && mkdir "$SWEEP_LOCK" 2>/dev/null; then
-    touch "$SWEEP_STAMP" 2>/dev/null || true
-    (
-      for __s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
-        # Skip sessions that poll themselves (they have an attached tmux client).
-        [ "$(tmux list-clients -t "$__s" 2>/dev/null | wc -l | tr -d ' ')" -eq 0 ] || continue
-        __sr="$(tmux show-options -t "$__s" -v status-right 2>/dev/null)"
-        case "$__sr" in *dev-tmux-title.sh*) ;; *) continue ;; esac
-        # Recover the title invocation from "#(<cmd>)  %H:%M" and re-run it.
-        __cmd="${__sr#*#(}"; __cmd="${__cmd%")  %H:%M"}"
-        [ -n "$__cmd" ] && eval "$__cmd" >/dev/null 2>&1
-      done
-      rmdir "$SWEEP_LOCK" 2>/dev/null || true
-    ) &
-  fi
-fi
+# NOTE: the periodic board data-refresh + sidebar re-sort, and the backgrounded-
+# session title sweep, that used to live here are now owned by dev-tmux-titled.sh,
+# the single daemon that drives this worker. It walks every session each tick
+# (including 0-client backgrounded ones), so per-invocation sweeping here was
+# redundant, and it runs the reflect/collect centrally (see reflect_if_due there).

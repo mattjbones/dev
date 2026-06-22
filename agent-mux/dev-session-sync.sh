@@ -40,6 +40,14 @@ set -euo pipefail
 #       ongoing chat syncs whenever dev.sh runs or a session closes; run
 #       manually to snapshot mid-chat.
 #
+#   ./dev-session-sync.sh pull <agent-session-id> <local-worktree>
+#       Pull one transcript from OneDrive into the Claude project dir for
+#       <local-worktree> (this machine's path). Called by dev.sh on restore,
+#       once it has resolved the worktree locally — the manifest records the
+#       *originating* host's worktree path, which differs across machines when
+#       usernames differ, so the destination must be computed from the local
+#       worktree, not the recorded one.
+#
 #   ./dev-session-sync.sh sync          (also: dev sync)
 #       Interactive fzf picker over sessions active on other hosts:
 #       TAB to select some, ctrl-a for all, enter to restore the selection
@@ -114,25 +122,28 @@ push_transcripts() {
   done <<< "$ids"
 }
 
-# Pull one transcript from OneDrive into the local Claude projects dir for
-# <worktree>, but only if the OneDrive copy is newer than any local one
-# (never clobbers a chat that progressed further on this machine).
+# Pull one transcript from OneDrive into the Claude project dir for <worktree>
+# (this machine's path), but only if the OneDrive copy is newer than the local
+# one there (never clobbers a chat that progressed further on this machine).
+#
+# <worktree> must be the LOCAL path: the project dir is the only place
+# `claude --resume` looks when run from that worktree. We deliberately target it
+# directly rather than reusing any copy found under another project dir — a
+# transcript synced from a host with a different username lives under a
+# different ~/workspace path (a different project dir), and refreshing *that*
+# would leave the dir for this machine's worktree empty, so --resume fails.
 pull_transcript() {
   local id="$1" worktree="$2"
   [ -n "$id" ] && [ -n "$worktree" ] || return 0
   local od_file="$TRANSCRIPTS_DIR/$id.jsonl"
   [ -f "$od_file" ] || return 0
-  local existing dest
-  existing="$(ls "$HOME/.claude/projects"/*/"$id.jsonl" 2>/dev/null | head -1 || true)"
-  if [ -n "$existing" ]; then
-    if [ "$od_file" -nt "$existing" ]; then
-      cp -p "$od_file" "$existing" 2>/dev/null || true
-    fi
-    return 0
-  fi
+  local dest local_file
   dest="$HOME/.claude/projects/$(munge_path "$worktree")"
+  local_file="$dest/$id.jsonl"
   mkdir -p "$dest"
-  cp -p "$od_file" "$dest/$id.jsonl" 2>/dev/null || true
+  if [ ! -f "$local_file" ] || [ "$od_file" -nt "$local_file" ]; then
+    cp -p "$od_file" "$local_file" 2>/dev/null || true
+  fi
 }
 
 # Atomic in-place jq edit of this host's manifest.
@@ -303,12 +314,13 @@ cmd_restore() {
       continue
     fi
     echo "Restoring '$session' (branch: ${branch:-<main lupa>}, model: $model)..."
-    # Drop the other host's transcript into the local Claude projects dir so
-    # the agent pane resumes the chat rather than starting fresh. Assumes the
-    # worktree path is the same on both machines (it is: ~/workspace/<branch>).
-    pull_transcript "$agent_session" "$worktree"
     # Reuse the recorded Claude session id: resumes the chat if its transcript
     # exists on this machine, otherwise starts fresh under the same id.
+    # dev.sh pulls the transcript itself (via `pull`) once it has resolved the
+    # LOCAL worktree path — the manifest's worktree is the *other* host's path,
+    # and usernames differ across machines (~/workspace/<branch> is a different
+    # absolute path, hence a different Claude project dir), so the remote path
+    # can't be used to place the transcript here.
     if [ -n "$branch" ]; then
       DEV_TMUX_NO_ATTACH=1 DEV_CLAUDE_SESSION_ID="$agent_session" \
         "$DEV_TMUX" --model "$model" "$branch"
@@ -357,6 +369,7 @@ case "${1:-}" in
   list)      shift; cmd_list "$@" ;;
   restore)   shift; cmd_restore "$@" ;;
   push)      shift; cmd_push ;;
+  pull)      shift; ensure_base && pull_transcript "$@" ;;
   sync)      shift; cmd_sync ;;
   adopt)     shift; cmd_adopt "$@" ;;
   __entry)   shift; cmd_entry "$@" ;;

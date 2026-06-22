@@ -9,6 +9,11 @@ set -euo pipefail
 #   ./dev-ctl.sh              Open interactive command centre
 #   ./dev-ctl.sh list         List sessions (non-interactive)
 #   ./dev-ctl.sh new <branch> Create a new workspace
+#   ./dev-ctl.sh reap         Show idle tmux sessions that would be reaped (dry-run)
+#   ./dev-ctl.sh reap --apply Kill idle, unattached tmux sessions (worktrees KEPT,
+#                             chats resumable) to reclaim CPU/RAM. Guards: never
+#                             attached, never active within DEV_REAP_IDLE_HOURS
+#                             (default 24h), never the main lupa session.
 #   ./dev-ctl.sh verify-main  Unshallow main lupa repo if needed (for worktrees)
 #
 # Keybindings (in fzf):
@@ -17,6 +22,7 @@ set -euo pipefail
 #   ctrl-s   Send free-text prompt to Claude pane
 #   ctrl-p   Quick-actions (to Claude, or !devctl:* local — e.g. verify-main)
 #   ctrl-x   Stop docker (keep session)
+#   ctrl-k   Reap idle tmux sessions (keeps worktrees; dry-run + confirm)
 #   ctrl-d   Full cleanup (docker down, kill session, remove worktree)
 #   ctrl-r   Refresh list
 #
@@ -938,6 +944,18 @@ action_auto_cleanup() {
       continue
     fi
 
+    # Never pull the rug on a session you're actively viewing: if a tmux session
+    # for this worktree is attached right now, keep it regardless of merge/PR
+    # status. Tear it down deliberately (ctrl-d) once you're done with it.
+    if tmux list-sessions -F '#{session_name} #{session_attached}' 2>/dev/null \
+         | grep -qx "$wt_name 1"; then
+      printf "  ${GREEN}● Keep${NC}   ${BOLD}$wt_name${NC}\n"
+      printf "           ${DIM}tmux session attached — open right now${NC}\n"
+      echo ""
+      kept=$((kept + 1))
+      continue
+    fi
+
     # Activity age: most recent of the branch's last commit and the worktree mtime
     # (a no-commit worktree's last commit is main's, so mtime is what counts).
     local grace_days="${DEV_CLEANUP_GRACE_DAYS:-7}"
@@ -1073,6 +1091,81 @@ action_auto_cleanup() {
     printf "${YELLOW}Would remove $removed worktrees, keep $kept${NC}\n"
   else
     printf "${GREEN}Removed $removed worktrees, kept $kept${NC}\n"
+  fi
+}
+
+# Reclaim CPU/RAM by killing IDLE tmux sessions (and with them each session's
+# Claude agent + its MCP servers), while LEAVING THE WORKTREE ON DISK. This is
+# non-destructive: no branch, worktree, or uncommitted change is touched —
+# `dev <branch>` rebuilds the layout and resumes the synced chat later.
+#
+# Guards (a session is kept if ANY hold):
+#   • it is the main `lupa` session
+#   • a client is attached (you're looking at it right now)
+#   • it has been active within the idle threshold (DEV_REAP_IDLE_HOURS, def 24h)
+#     — so a fresh session you just used is never reaped, only genuinely stale ones
+#
+# Dry-run by default; pass --apply to actually kill.
+action_reap_sessions() {
+  local apply=false
+  [ "${1:-}" = "--apply" ] && apply=true
+
+  local idle_threshold="${DEV_REAP_IDLE_HOURS:-24}"
+  local now_ts; now_ts="$(date +%s)"
+
+  local sessions
+  sessions="$(tmux list-sessions -F '#{session_name}	#{session_attached}	#{session_activity}' 2>/dev/null || true)"
+  if [ -z "$sessions" ]; then
+    printf "${DIM}No tmux sessions.${NC}\n"
+    return 0
+  fi
+
+  local reaped=0 kept=0
+  local name att act idle_h
+  local to_kill=""
+  while IFS=$'\t' read -r name att act; do
+    [ -z "$name" ] && continue
+    idle_h=$(( (now_ts - act) / 3600 ))
+
+    if [ "$name" = "lupa" ]; then
+      kept=$((kept + 1)); continue
+    fi
+    if [ "$att" = "1" ]; then
+      printf "  ${GREEN}● Keep${NC}         %-44s ${DIM}attached${NC}\n" "$name"
+      kept=$((kept + 1)); continue
+    fi
+    if [ "$idle_h" -lt "$idle_threshold" ]; then
+      printf "  ${GREEN}● Keep${NC}         %-44s ${DIM}active ${idle_h}h ago (< ${idle_threshold}h)${NC}\n" "$name"
+      kept=$((kept + 1)); continue
+    fi
+
+    if $apply; then
+      printf "  ${RED}✕ Reap${NC}         %-44s ${DIM}idle ${idle_h}h${NC}\n" "$name"
+      to_kill="$to_kill$name"$'\n'
+    else
+      printf "  ${YELLOW}○ Would reap${NC}   %-44s ${DIM}idle ${idle_h}h${NC}\n" "$name"
+    fi
+    reaped=$((reaped + 1))
+  done <<< "$sessions"
+
+  if $apply && [ -n "$to_kill" ]; then
+    # Snapshot the latest chats to OneDrive before killing, so each reaped
+    # session resumes from where it left off (the session-closed hook also
+    # reconciles, but pushing here guarantees the newest state is saved first).
+    "$SCRIPT_DIR/dev-session-sync.sh" push 2>/dev/null || true
+    while IFS= read -r name; do
+      [ -z "$name" ] && continue
+      tmux kill-session -t "$name" 2>/dev/null || true
+    done <<< "$to_kill"
+    # Mark the killed sessions inactive in the OneDrive manifest.
+    "$SCRIPT_DIR/dev-session-sync.sh" reconcile 2>/dev/null || true
+  fi
+
+  echo ""
+  if $apply; then
+    printf "${GREEN}Reaped $reaped idle session(s), kept $kept.${NC} ${DIM}Worktrees untouched — 'dev <branch>' resumes.${NC}\n"
+  else
+    printf "${YELLOW}Would reap $reaped idle session(s), keep $kept.${NC} ${DIM}Re-run with --apply to do it.${NC}\n"
   fi
 }
 
@@ -1247,6 +1340,20 @@ case "${1:-}" in
     echo "Press any key to continue..."
     read -r -n 1
     ;;
+  __reap_sessions)
+    # Always show the dry-run first, then confirm before killing anything.
+    action_reap_sessions
+    echo ""
+    printf "Reap the idle sessions marked above? (worktrees kept) [y/N] "
+    read -r _reap_reply
+    case "$_reap_reply" in
+      y|Y) echo ""; action_reap_sessions --apply ;;
+      *)   echo "Aborted — nothing killed." ;;
+    esac
+    echo ""
+    echo "Press any key to continue..."
+    read -r -n 1
+    ;;
 
   # Public commands
   list)
@@ -1266,6 +1373,15 @@ case "${1:-}" in
   auto-cleanup-dry)
     action_auto_cleanup true
     ;;
+  reap|reap-sessions)
+    # Dry-run unless --apply: kill idle, unattached tmux sessions (freeing their
+    # Claude agent + MCP servers) but keep every worktree on disk.
+    if [ "${2:-}" = "--apply" ]; then
+      action_reap_sessions --apply
+    else
+      action_reap_sessions
+    fi
+    ;;
   rebase-all)
     action_rebase_all
     ;;
@@ -1284,7 +1400,7 @@ case "${1:-}" in
       --ansi \
       --reverse \
       --header-first \
-      --header="enter=attach  ^n=new  ^s=send  ^p=quick-action  ^x=stop  ^d=cleanup  ^u=rebase-all  ^g=auto-cleanup  ^b=prune-branches  ^r=refresh · PR/merge" \
+      --header="enter=attach  ^n=new  ^s=send  ^p=quick-action  ^x=stop  ^d=cleanup  ^k=reap-idle  ^u=rebase-all  ^g=auto-cleanup  ^b=prune-branches  ^r=refresh · PR/merge" \
       --prompt="workspace > " \
       --info=inline-right \
       --info-command="$SELF __info" \
@@ -1297,6 +1413,7 @@ case "${1:-}" in
       --bind="ctrl-x:execute-silent($SELF __stop \$($EXTRACT))+reload($SELF __list)" \
       --bind="ctrl-d:execute-silent(nohup $SELF __cleanup \$($EXTRACT) >/tmp/dev-ctl-cleanup-\$($EXTRACT).log 2>&1 &)+reload($SELF __list)" \
       --bind="ctrl-u:execute($SELF __rebase_all)+reload($SELF __list)" \
+      --bind="ctrl-k:execute($SELF __reap_sessions)+reload($SELF __list)" \
       --bind="ctrl-g:execute($SELF __auto_cleanup)+reload($SELF __list)" \
       --bind="ctrl-b:execute($SELF __prune_branches)+reload($SELF __list)" \
       --bind="ctrl-r:reload($SELF __list)" \

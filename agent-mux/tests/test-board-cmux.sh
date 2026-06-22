@@ -18,13 +18,12 @@ case "\$1" in
     [ -f "$WS_FILE" ] && cat "$WS_FILE" || true
     ;;
   new-workspace)
-    name=""
-    while [ \$# -gt 0 ]; do
-      case "\$1" in --name) name="\$2"; shift 2 ;; *) shift ;; esac
-    done
+    # Faithful to real cmux: --name does NOT stick (the shell's terminal-title
+    # escape clobbers it), and the ref is printed to stdout as "OK workspace:N".
     count=\$(wc -l < "$WS_FILE" 2>/dev/null || echo 0)
     ref="workspace:\$((count + 10))"
-    echo "  \$ref  \$name" >> "$WS_FILE"
+    echo "  \$ref  Terminal \$((count + 10))" >> "$WS_FILE"
+    echo "OK \$ref"
     ;;
   workspace-action)
     # Handle rename: update the workspace title in WS_FILE
@@ -56,19 +55,13 @@ printf '%s' "$RANKED" | "$DIR/../dev-board-cmux.sh"
 # --- header creation ---
 assert_eq "$(grep -c 'new-workspace' "$LOG")" "6" "creates 6 headers when all absent"
 
-# --- never pins anything; unpins headers (6) + every seq item (8) = 14 ---
+# --- every created header is renamed so its name persists (--name is clobbered) ---
+assert_eq "$(grep -c 'action rename' "$LOG")" "6" "renames each created header (name persistence)"
+
+# --- ordering is one atomic reorder-workspaces --order call; no pin/unpin/move-top ---
 assert_eq "$(grep -c 'action pin' "$LOG" || true)" "0" "never pins"
-assert_eq "$(grep -c 'action unpin' "$LOG")" "14" "unpins 6 headers + all 8 seq items"
-
-# --- one move-top per seq item: 6 headers + 2 workspaces = 8 ---
-assert_eq "$(grep -c 'action move-top' "$LOG")" "8" "one move-top per seq item (8 items)"
-
-# --- move-top is applied to the Act Now header (workspace:10) ---
-if grep -q 'workspace-action --workspace workspace:10 --action move-top' "$LOG"; then
-  pass
-else
-  fail "move-top applied to Act Now header (workspace:10)"
-fi
+assert_eq "$(grep -c 'action unpin' "$LOG" || true)" "6" "unpins each header (6); atomic reorder adds none"
+assert_eq "$(grep -c 'action move-top' "$LOG" || true)" "0" "atomic reorder: no move-top calls"
 
 # --- no per-workspace coloring: clear-color count == 0 ---
 assert_eq "$(grep -c 'action clear-color' "$LOG" || true)" "0" "no clear-color calls (no per-workspace coloring)"
@@ -79,22 +72,30 @@ assert_eq "$(grep -c 'action set-color' "$LOG")" "6" "exactly 6 set-color calls 
 # --- a description is set for each header (6 set-description calls) ---
 assert_eq "$(grep -c 'set-description' "$LOG")" "6" "a description is set for each header"
 
-# --- no literal * used in move-top calls (selected-prefix must be normalized) ---
-if grep -q 'workspace-action --workspace \* --action move-top' "$LOG"; then
-  fail "move-top used literal * (selected-prefix bug)"
+# --- ordering is realized by exactly one atomic reorder-workspaces --order call ---
+assert_eq "$(grep -c 'reorder-workspaces --order' "$LOG")" "1" "one atomic reorder-workspaces --order call"
+ORDER_LINE="$(grep 'reorder-workspaces --order' "$LOG" | head -1)"
+
+# --- the --order list uses real refs, never the literal selected-prefix * ---
+if printf '%s' "$ORDER_LINE" | grep -q -- '--order [^ ]*\*'; then
+  fail "reorder --order used literal * (selected-prefix bug)"
 else
   pass
 fi
 
-# --- selected workspace move-top'd by real ref (workspace:1), not * ---
-if grep -q 'workspace-action --workspace workspace:1 --action move-top' "$LOG"; then
+# --- selected workspace (workspace:1) present in the order by real ref ---
+if printf '%s' "$ORDER_LINE" | grep -q 'workspace:1'; then
   pass
 else
-  fail "selected workspace move-top'd by real ref workspace:1, not *"
+  fail "selected workspace workspace:1 present in --order list"
 fi
 
-# --- ordering uses move-top only; no reorder-workspace calls remain ---
-assert_eq "$(grep -c 'reorder-workspace' "$LOG" || true)" "0" "no reorder-workspace calls (move-top only)"
+# --- Act Now header (workspace:10) leads the order ---
+if printf '%s' "$ORDER_LINE" | grep -qE -- '--order workspace:10(,|$| )'; then
+  pass
+else
+  fail "Act Now header (workspace:10) leads the --order list"
+fi
 
 # -----------------------------------------------------------------------
 # Test B: existing header with OLD glyph -> rename in place, not duplicated
@@ -111,13 +112,10 @@ case "\$1" in
     [ -f "$WS_FILE2" ] && cat "$WS_FILE2" || true
     ;;
   new-workspace)
-    name=""
-    while [ \$# -gt 0 ]; do
-      case "\$1" in --name) name="\$2"; shift 2 ;; *) shift ;; esac
-    done
     count=\$(wc -l < "$WS_FILE2" 2>/dev/null || echo 0)
     ref="workspace:\$((count + 10))"
-    echo "  \$ref  \$name" >> "$WS_FILE2"
+    echo "  \$ref  Terminal \$((count + 10))" >> "$WS_FILE2"
+    echo "OK \$ref"
     ;;
   workspace-action)
     ws=""; new_title=""
@@ -166,20 +164,9 @@ else
   fail "rename issued with correct new full title for In Progress"
 fi
 
-# create-vs-rename are mutually exclusive per tier: no tier got both new-workspace and rename
-new_ws_names=$(grep 'new-workspace' "$LOG2" | grep -o -- '--name [^-]*' | sed 's/--name //' | tr -d ' ')
-rename_titles=$(grep 'action rename' "$LOG2" | grep -o -- '--title .*' | sed 's/--title //')
-overlap=0
-while IFS= read -r nm; do
-  if printf '%s\n' "$rename_titles" | grep -qF "$nm"; then
-    overlap=1
-  fi
-done <<< "$new_ws_names"
-if [ "$overlap" -eq 0 ]; then
-  pass
-else
-  fail "create and rename fired for the same header tier (not mutually exclusive)"
-fi
+# every header (5 created + 1 pre-existing) is renamed to its current full title,
+# so created headers get a persistent name and pre-existing ones heal glyph drift.
+assert_eq "$(grep -c 'action rename' "$LOG2")" "6" "renames all 6 headers (5 created + 1 healed)"
 
 # -----------------------------------------------------------------------
 # --- no-op when CMUX_BIN is non-executable ---
