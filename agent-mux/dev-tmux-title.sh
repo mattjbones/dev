@@ -227,13 +227,17 @@ if [ "$STATE_PUSH" = true ]; then
       *)         cmux_run clear-status build || true ;;
     esac
 
-    # Keep the sidebar quiet: a session shows NOTHING about context until usage is high
-    # (>= DEV_BOARD_CONTEXT_WARN) — then it gets both a textual ⚠ pill and the progress
-    # gauge below. Low-usage sessions stay bare (just the name), so the sidebar only
-    # "speaks up" for sessions that actually need attention.
+    # Always show a compact context % pill so every session's usage is glanceable. Below
+    # DEV_BOARD_CONTEXT_WARN it's a quiet grey "NN%"; at/above it escalates to an orange
+    # "⚠ NN% context" warning (and the progress gauge below also appears), so a session
+    # only "speaks up" when it actually needs attention.
     CONTEXT_WARN="${DEV_BOARD_CONTEXT_WARN:-70}"
-    if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]] && [ "$PERCENT" -ge "$CONTEXT_WARN" ]; then
-      cmux_run set-status context "⚠ ${PERCENT}% context" --icon gauge --color "#ff9f0a" || true
+    if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]]; then
+      if [ "$PERCENT" -ge "$CONTEXT_WARN" ]; then
+        cmux_run set-status context "⚠ ${PERCENT}% context" --icon gauge --color "#ff9f0a" || true
+      else
+        cmux_run set-status context "${PERCENT}%" --icon gauge --color "#8e8e93" || true
+      fi
     else
       cmux_run clear-status context || true
     fi
