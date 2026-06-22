@@ -156,8 +156,13 @@ elif [ -n "$LABEL" ]; then
   fi
 fi
 
-# --- Set Ghostty tab title ---
-WORKSPACE_TITLE="${SERVER_ICON} ${AGENT_ICON} ${WORKSPACE_NAME}${CLAUDE_STATUS}${TOKEN_INFO}"
+# --- Set the OSC window title (drives the terminal/Ghostty tab + cmux's active-fold) ---
+# Deliberately NO SERVER_ICON here. cmux folds this title into the sidebar row ONLY while the
+# agent is active (idle rows show the bare name + pills), so a whale in the title would render
+# the docker glyph twice on active rows — once folded here, once in the build pill below — and
+# not at all on idle rows. The build pill is the single, state-independent docker source, so we
+# keep docker out of the title entirely and let the pill own it.
+WORKSPACE_TITLE="${AGENT_ICON} ${WORKSPACE_NAME}${CLAUDE_STATUS}${TOKEN_INFO}"
 WORKSPACE_TITLE="$(printf '%s' "$WORKSPACE_TITLE" | sed 's/^ *//;s/  */ /g')"
 
 # --- Push state to the terminal titles and cmux, change-detected + rate-limited ---
@@ -214,14 +219,15 @@ if [ "$STATE_PUSH" = true ]; then
   # Mirror the same state into cmux when available.
   if cmux_available; then
     # cmux owns SOME of the sidebar row natively, but not all — so we split:
-    #   - agent kind + context %: cmux shows these itself (✳ when the agent is active, its
-    #     own context % in a gauge pill when idle / folded into the title when active). Our
-    #     old "agent" and "NN%" pills just duplicated cmux's, so we clear them and never set.
-    #   - docker/server/storybook (build): cmux has NO native awareness of these. It does not
-    #     read SERVER_ICON from the OSC window title (set-titles-string) — there is no such
-    #     feature. The sidebar whale was ONLY ever this build pill, so clearing it (as an
-    #     earlier change wrongly did, assuming cmux folded the glyph in) dropped docker state
-    #     from the sidebar entirely. We keep pushing it; it's the single source for that glyph.
+    #   - agent kind + context %: cmux shows these itself (✳ when active, its own context %
+    #     in a gauge pill when idle / folded into the title when active). Our old "agent" and
+    #     "NN%" pills just duplicated cmux's, so we clear them and never set.
+    #   - docker/server/storybook (build): cmux folds the OSC title's glyph into the row, but
+    #     ONLY while the agent is active — idle rows show the bare name with no fold. So the
+    #     title-whale alone vanishes on idle sessions (the original "docker not showing" bug),
+    #     while a pill alone next to an active row's folded title shows it twice. We resolve
+    #     both by keeping the glyph OUT of the title (see WORKSPACE_TITLE above) and pushing
+    #     this pill unconditionally — it's the single, state-independent docker source.
     cmux_run clear-status agent || true
     # Emoji in the label already conveys the kind, so no --icon (avoids a redundant glyph).
     case "$BUILD_STATUS_VALUE" in
