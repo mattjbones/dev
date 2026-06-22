@@ -213,38 +213,27 @@ if [ "$STATE_PUSH" = true ]; then
 
   # Mirror the same state into cmux when available.
   if cmux_available; then
-    # NOTE: we intentionally do NOT rename the workspace. cmux owns the name (its ticket
-    # title + live agent status); our rename fought cmux's and the docker glyph flickered.
-    # Server/docker state is shown via the build status pill below, which cmux never overwrites.
-    # No "agent" pill: the model is ~always claude and its % duplicated the progress bar.
-    # The agent's live activity goes in the context pill (below), the % in the progress bar.
+    # We no longer push status pills to the sidebar row — cmux owns it natively. It shows
+    # its own docker glyph and context % (its gauge pill when the agent is idle; folded
+    # into the title when active). Our old build + context pills just duplicated those —
+    # the "🐳 docker" pill sat next to cmux's own whale, the "NN%" pill next to cmux's own
+    # %. So we clear every key we used to own and let cmux be the single source.
+    #
+    # We still set the OSC window title below (set-titles-string); its SERVER_ICON is what
+    # cmux reads to fold the 🐳 + % into the active workspace title, so docker state still
+    # surfaces — just once, via cmux, instead of twice.
     cmux_run clear-status agent || true
-    # Emoji in the label already conveys the kind, so no --icon (avoids a redundant glyph).
-    case "$BUILD_STATUS_VALUE" in
-      docker)    cmux_run set-status build "🐳 docker" --color "#0a84ff" || true ;;
-      server)    cmux_run set-status build "🏃 server" --color "#0a84ff" || true ;;
-      storybook) cmux_run set-status build "📖 storybook" --color "#0a84ff" || true ;;
-      *)         cmux_run clear-status build || true ;;
-    esac
+    cmux_run clear-status build || true
 
-    # Always show a compact context % pill so every session's usage is glanceable. Below
-    # DEV_BOARD_CONTEXT_WARN it's a quiet grey "NN%"; at/above it escalates to an orange
-    # "⚠ NN% context" warning (and the progress gauge below also appears), so a session
-    # only "speaks up" when it actually needs attention.
+    # Context % is owned by cmux (see above); we never set a context pill. CONTEXT_WARN is
+    # still used by the gauge below — a non-numeric bar that flags a near-full session, so
+    # it doesn't collide with cmux's %.
     CONTEXT_WARN="${DEV_BOARD_CONTEXT_WARN:-70}"
-    if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]]; then
-      if [ "$PERCENT" -ge "$CONTEXT_WARN" ]; then
-        cmux_run set-status context "⚠ ${PERCENT}% context" --icon gauge --color "#ff9f0a" || true
-      else
-        cmux_run set-status context "${PERCENT}%" --icon gauge --color "#8e8e93" || true
-      fi
-    else
-      cmux_run clear-status context || true
-    fi
+    cmux_run clear-status context || true
 
     # Only surface the gauge when usage is high (>= DEV_BOARD_CONTEXT_WARN); below that the
-    # row stays bare (just the name) so only attention-worthy sessions show a bar. No label
-    # either — the bar itself carries the level, and the ⚠ context pill above states the %.
+    # row stays bare (just cmux's name + its own title %) so only attention-worthy sessions
+    # show a bar. No label — the bar carries the level and cmux's title already states the %.
     if [ -n "$PERCENT" ] && [[ "$PERCENT" =~ ^[0-9]+$ ]] && [ "$PERCENT" -ge "$CONTEXT_WARN" ]; then
       cmux_run set-progress "$(awk "BEGIN { printf \"%.2f\", $PERCENT / 100 }")" || true
     else
