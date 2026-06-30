@@ -13,6 +13,12 @@
 //              the TUI below — prefer it over an external `watch -c -n 60 linear-dash`,
 //              which can't do navigation, live resize, or clickable links.
 //   --all,-a   Expand the extra PR sections (in --watch, press m to toggle live).
+//   --group-by priority|status|project
+//              How to group the rows into sections (default: priority). In --watch,
+//              Tab cycles through the three groupings live.
+//   --hide-merged
+//              Hide rows whose PR has merged (landed on main / GitHub MERGED). Off by
+//              default; in --watch, M toggles it live.
 //   --show-cancelled
 //              Include cancelled and Duplicate tickets, which are dropped from the
 //              list by default (bucketed with completed when shown).
@@ -25,7 +31,9 @@
 //   /            search; type to filter, Enter to confirm, Esc to cancel/clear
 //   n / N        next / previous search match
 //   ↵ Enter      open the details page for the selected row
+//   Tab          cycle grouping: priority → status → project
 //   m            show / hide the extra PR sections
+//   M            hide / show merged rows
 //   q / Ctrl-C   quit  ·  resizing the terminal re-renders
 //
 // Details page (↵ from the list): CI outline (failing/running + passing count),
@@ -67,7 +75,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 
 // ---------- args ----------
 function parseArgs(argv) {
-  const args = { project: null, repo: DEFAULT_REPO, watch: null, all: false, showCancelled: false, json: false, branches: [] };
+  const args = { project: null, repo: DEFAULT_REPO, watch: null, all: false, showCancelled: false, groupBy: 'priority', hideMerged: false, json: false, branches: [] };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--repo') {
@@ -79,15 +87,25 @@ function parseArgs(argv) {
       args.all = true;
     } else if (a === '--show-cancelled' || a === '--show-canceled') {
       args.showCancelled = true;
+    } else if (a === '--group-by' || a === '--group') {
+      const v = (argv[++i] || '').toLowerCase();
+      if (['priority', 'status', 'project'].includes(v)) {
+        args.groupBy = v;
+      }
+    } else if (a === '--hide-merged') {
+      args.hideMerged = true;
     } else if (a === '--help' || a === '-h') {
       console.log('Usage: linear-dash [project url|uuid|name] [--repo owner/name] [--watch [secs]] [--all]');
       console.log('  --repo            GitHub repo for PRs (default: LupaPets/lupa)');
       console.log('  --watch           interactive self-refreshing TUI (default 60s)');
       console.log('  --all,-a          expand the extra PR sections (in --watch, m toggles)');
+      console.log('  --group-by        group rows by priority|status|project (default: priority)');
+      console.log('  --hide-merged     hide rows whose PR has merged (in --watch, M toggles)');
       console.log('  --show-cancelled  include cancelled/duplicate tickets (hidden by default)');
       console.log('');
       console.log('  --watch keys: j/k move · h/l section · Ctrl-d/u half-page · g/G ends');
-      console.log('                / search · n/N next match · ↵ details · m extras · q quit');
+      console.log('                / search · n/N next match · ↵ details · Tab group');
+      console.log('                m extras · M hide-merged · r refresh · q quit');
       process.exit(0);
     } else if (a === '--json') {
       args.json = true;
@@ -104,6 +122,11 @@ const ARGS = parseArgs(process.argv);
 // Extra PR sections collapse to a one-line summary unless --all is passed; in
 // --watch mode the 'm' key toggles this live (see the watch loop below).
 let showExtras = ARGS.all;
+
+// How rows are grouped into sections, and whether merged rows are hidden. Both are
+// seeded from flags and toggled live in --watch (Tab cycles grouping, M hides merged).
+let groupBy = ARGS.groupBy;
+let hideMerged = ARGS.hideMerged;
 
 // ---------- ANSI ----------
 const useColor = !process.env.NO_COLOR;
@@ -871,6 +894,48 @@ function priorityBadge(ticket) {
 
 const prioritySortKey = (ticket) => (ticket.priority === 0 ? 5 : ticket.priority);
 
+// Group rows into [label, list, colorFn] sections per the active grouping. The
+// caller sorts each list afterwards. Empty buckets are dropped for priority/project
+// (avoids noise); status keeps all three so the familiar shape is stable.
+function groupRows(rows, mode) {
+  if (mode === 'project') {
+    const colors = [yellow, blue, magenta, cyan, green];
+    const byProject = new Map();
+    for (const row of rows) {
+      const key = row.ticket.projectName ?? '(no project)';
+      if (!byProject.has(key)) {
+        byProject.set(key, []);
+      }
+      byProject.get(key).push(row);
+    }
+    const names = [...byProject.keys()].sort(
+      (a, b) => (a === '(no project)') - (b === '(no project)') || a.localeCompare(b),
+    );
+    return names.map((name, i) => [name.toUpperCase(), byProject.get(name), colors[i % colors.length]]);
+  }
+  if (mode === 'priority') {
+    const buckets = [
+      [1, 'URGENT', red],
+      [2, 'HIGH', yellow],
+      [3, 'MEDIUM', blue],
+      [4, 'LOW', dim],
+    ];
+    const sections = buckets.map(([p, label, color]) => [label, rows.filter((r) => r.ticket.priority === p), color]);
+    sections.push(['NONE', rows.filter((r) => !r.ticket.priority), dim]);
+    return sections.filter(([, list]) => list.length > 0);
+  }
+  // status (default): the familiar three state buckets.
+  const groups = { inProgress: [], todo: [], completed: [] };
+  for (const row of rows) {
+    groups[row.group].push(row);
+  }
+  return [
+    ['IN PROGRESS', groups.inProgress, yellow],
+    ['TODO', groups.todo, blue],
+    ['COMPLETED', groups.completed, green],
+  ];
+}
+
 // Live status: GitHub PR state wins over Linear.
 function liveGroupAndStatus(ticket, pr, onMain) {
   if (pr?.state === 'MERGED' || onMain) {
@@ -907,36 +972,11 @@ function render(project, rows, sourceLabel, extras, now) {
   const width = Math.min(process.stdout.columns || Number(process.env.COLUMNS) || 130, 160);
   const byPriority = (a, b) => prioritySortKey(a.ticket) - prioritySortKey(b.ticket) || a.ticket.id.localeCompare(b.ticket.id);
 
-  // Project mode: sections by state. "Mine" mode: sections by Linear project.
-  let sections;
-  let doneCount;
-  if (project.mode === 'mine') {
-    const colors = [yellow, blue, magenta, cyan, green];
-    const byProject = new Map();
-    for (const row of rows) {
-      const key = row.ticket.projectName ?? '(no project)';
-      if (!byProject.has(key)) {
-        byProject.set(key, []);
-      }
-      byProject.get(key).push(row);
-    }
-    const names = [...byProject.keys()].sort(
-      (a, b) => (a === '(no project)') - (b === '(no project)') || a.localeCompare(b),
-    );
-    sections = names.map((name, i) => [name.toUpperCase(), byProject.get(name), colors[i % colors.length]]);
-    doneCount = rows.filter((row) => row.group === 'completed').length;
-  } else {
-    const groups = { inProgress: [], todo: [], completed: [] };
-    for (const row of rows) {
-      groups[row.group].push(row);
-    }
-    sections = [
-      ['IN PROGRESS', groups.inProgress, yellow],
-      ['TODO', groups.todo, blue],
-      ['COMPLETED', groups.completed, green],
-    ];
-    doneCount = groups.completed.length;
-  }
+  // Hide-merged drops merged rows before grouping (the header reports how many).
+  const mergedCount = rows.filter((row) => row.isMerged).length;
+  const visibleRows = hideMerged ? rows.filter((row) => !row.isMerged) : rows;
+  const sections = groupRows(visibleRows, groupBy);
+  const doneCount = visibleRows.filter((row) => row.group === 'completed').length;
   for (const [, list] of sections) {
     list.sort(byPriority);
   }
@@ -946,7 +986,11 @@ function render(project, rows, sourceLabel, extras, now) {
     kind: 'fixed',
     text:
       bold(`  ${project.name}`) +
-      dim(`  ·  target ${project.targetDate ?? '—'}  ·  ${doneCount}/${rows.length} done  ·  refreshed ${now}  ·  `) +
+      dim(
+        `  ·  target ${project.targetDate ?? '—'}  ·  ${doneCount}/${visibleRows.length} done  ·  by ${groupBy}` +
+          (hideMerged && mergedCount ? `  ·  ${mergedCount} merged hidden` : '') +
+          `  ·  refreshed ${now}  ·  `,
+      ) +
       sourceLabel,
   });
   items.push({ kind: 'fixed', text: dim('  ' + '─'.repeat(width - 4)) });
@@ -1325,7 +1369,8 @@ async function compute() {
     // and we don't want that to "uncomplete" a ticket whose PR is already on main.
     const prNum = pr?.number ?? ticket.prNumber;
     const onMain = prNum != null && mainPrNumbers.has(prNum);
-    return { ticket, pr, stack: pr ? stacks.get(pr.number) : undefined, ...liveGroupAndStatus(ticket, pr, onMain), readiness: mergeReadiness(pr, onMain, prNum) };
+    const isMerged = pr?.state === 'MERGED' || onMain;
+    return { ticket, pr, isMerged, stack: pr ? stacks.get(pr.number) : undefined, ...liveGroupAndStatus(ticket, pr, onMain), readiness: mergeReadiness(pr, onMain, prNum) };
   });
 
   // My open PRs not already shown above, split by whether they reference a ticket.
@@ -1410,7 +1455,7 @@ if (ARGS.json) {
   const search = { active: false, query: '', matches: [], origSel: 0 };
   let refreshing = false; // a compute() is in flight
   let manualRefresh = false; // user pressed r — show a transient indicator
-  const listHint = '  j/k · / search · ↵ details · r refresh · m extras · q quit';
+  const listHint = '  j/k · / search · ↵ details · ⇥ group · m extras · M merged · r refresh · q quit';
   const detailsHint = '  j/k scroll · g/G ends · r refresh · esc back · q quit';
   const halfPage = () => Math.max(1, Math.floor(((process.stdout.rows || 40) - 4) / 2));
   // Home, redraw with each line cleared to its end (\x1b[K) so a shorter line never
@@ -1661,8 +1706,21 @@ if (ARGS.json) {
       refreshNow();
       return;
     }
-    if (key === 'm' || key === 'M') {
+    if (key === 'm') {
       showExtras = !showExtras;
+      repaint();
+      return;
+    }
+    if (key === 'M') {
+      hideMerged = !hideMerged;
+      nav.sel = 0;
+      repaint();
+      return;
+    }
+    if (key === '\t') {
+      const order = ['priority', 'status', 'project'];
+      groupBy = order[(order.indexOf(groupBy) + 1) % order.length];
+      nav.sel = 0;
       repaint();
       return;
     }
