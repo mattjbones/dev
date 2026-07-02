@@ -6,6 +6,7 @@
 DEV_CMUX_EVENTS_FILE="${DEV_CMUX_EVENTS_FILE:-$HOME/.cmuxterm/events.jsonl}"
 DEV_STATE_DIR="${DEV_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dev}"
 DEV_EVENTS_CURSOR="${DEV_EVENTS_CURSOR:-/tmp/dev-tmux-title/events.seq}"
+DEV_PENDING_CLOSE="${DEV_PENDING_CLOSE:-$DEV_STATE_DIR/pending-close}"
 
 # Print the RUNNING compose project for <worktree>/docker, or empty. Discovered
 # from the container's working_dir label so branch-named projects resolve
@@ -56,13 +57,26 @@ dc_drain_closed() {
   printf '%s:%s\n' "$latest_boot" "$latest_seq" > "$cf"
 }
 
+# Collision-free marker path for a worktree. basename alone collides on a
+# case-insensitive FS and across nested worktrees, so suffix a hash of the FULL
+# path (lowercase hex → itself case-insensitive-safe).
+dc_marker_path() {
+  local wt="$1" h
+  h="$(printf '%s' "$wt" | { shasum 2>/dev/null || cksum; } | tr -cd '0-9a-f' | cut -c1-12)"
+  [ -n "$h" ] || h="x"
+  printf '%s/torn-down/%s-%s' "$DEV_STATE_DIR" "$(basename "$wt")" "$h"
+}
+
 # Tear down docker for one closed workspace uuid (guarded internals).
 dc_teardown_one() {
-  local uuid="$1" wt project base marker
+  local uuid="$1" wt project marker
   wt="$(dc_worktree_for_uuid "$uuid")"; [ -n "$wt" ] || return 0
   case "$wt" in "$HOME/workspace/"*) : ;; *) return 0 ;; esac   # only dev worktrees
   project="$(dc_project_for_worktree "$wt")"; [ -n "$project" ] || return 0
-  base="$(basename "$wt")"; marker="$DEV_STATE_DIR/torn-down/$base"
+  case "$project" in
+    lupa-proxy|supabase_*|supabase-*|buildx_buildkit_*|buildkit*) return 0 ;;
+  esac
+  marker="$(dc_marker_path "$wt")"
   if ( cd "$wt/docker" 2>/dev/null && docker compose -f docker-compose.dev.yml -p "$project" down ) >/dev/null 2>&1; then
     mkdir -p "$DEV_STATE_DIR/torn-down" 2>/dev/null || true
     printf '%s' "$project" > "$marker"
@@ -76,19 +90,38 @@ dc_handle_closes() {
   local u; for u in "$@"; do dc_teardown_one "$u"; done
 }
 
-# One daemon tick: drain new closes, handle them.
+# One daemon tick with a one-tick debounce so a cmux-quit burst that straddles
+# a tick boundary is still recognised as bulk. New closes accumulate in a
+# pending file; teardown only happens on a QUIET tick (no new closes). If the
+# accumulated set reaches >=3, it is treated as bulk (likely cmux quit) and
+# dropped without teardown.
 dc_tick() {
-  local uuids
-  uuids="$(dc_drain_closed)" || return 0
-  [ -n "$uuids" ] || return 0
+  local new pending count
+  new="$(dc_drain_closed)" || new=""
+  mkdir -p "$DEV_STATE_DIR" 2>/dev/null || true
+  pending="$(cat "$DEV_PENDING_CLOSE" 2>/dev/null || true)"
+  if [ -n "$new" ]; then
+    pending="$(printf '%s\n%s\n' "$pending" "$new" | grep . | sort -u)"
+    count="$(printf '%s\n' "$pending" | grep -c .)"
+    if [ "$count" -ge 3 ]; then
+      : > "$DEV_PENDING_CLOSE"
+      echo "dev-cleanup: bulk close ($count workspaces) — skipping teardown" >&2
+    else
+      printf '%s\n' "$pending" > "$DEV_PENDING_CLOSE"
+    fi
+    return 0
+  fi
+  # quiet tick → act on accumulated individual closes
+  [ -n "$pending" ] || return 0
+  : > "$DEV_PENDING_CLOSE"
   # shellcheck disable=SC2086
-  dc_handle_closes $uuids
+  dc_handle_closes $(printf '%s\n' "$pending" | grep .)
 }
 
 # On reattach: if this worktree's docker was torn down on close, re-up it.
 dc_reup() {
-  local wt="$1" base project marker
-  base="$(basename "$wt")"; marker="$DEV_STATE_DIR/torn-down/$base"
+  local wt="$1" project marker
+  marker="$(dc_marker_path "$wt")"
   [ -f "$marker" ] || return 0
   project="$(cat "$marker")"; [ -n "$project" ] || { rm -f "$marker"; return 0; }
   ( cd "$wt/docker" 2>/dev/null && docker compose -f docker-compose.dev.yml -p "$project" up -d ) >/dev/null 2>&1 || true
