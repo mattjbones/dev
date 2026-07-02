@@ -16,3 +16,9 @@ dc_project_for_worktree() {
             --filter status=running \
             --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null | head -1
 }
+
+# Map a cmux workspace uuid -> worktree path via the registry dev.sh writes.
+dc_worktree_for_uuid() {
+  local uuid="$1" reg="$DEV_STATE_DIR/workspace-map/$1"
+  [ -f "$reg" ] && cat "$reg" || true
+}
