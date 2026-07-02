@@ -22,3 +22,25 @@ dc_worktree_for_uuid() {
   local uuid="$1" reg="$DEV_STATE_DIR/workspace-map/$1"
   [ -f "$reg" ] && cat "$reg" || true
 }
+
+# Emit workspace_ids of new workspace.closed events since the cursor.
+# Cursor file stores "<boot_id>:<seq>". First run / boot change → baseline only.
+dc_drain_closed() {
+  local f="$DEV_CMUX_EVENTS_FILE" cf="$DEV_EVENTS_CURSOR"
+  [ -f "$f" ] || return 0
+  local last latest_boot latest_seq cur_boot cur_seq
+  last="$(tail -1 "$f" 2>/dev/null)"
+  latest_boot="$(printf '%s' "$last" | jq -r '.boot_id // empty' 2>/dev/null)"
+  latest_seq="$(printf '%s' "$last" | jq -r '.seq // 0' 2>/dev/null)"
+  [ -n "$latest_boot" ] || return 0
+  if [ -f "$cf" ]; then IFS=: read -r cur_boot cur_seq < "$cf"; else cur_boot=""; cur_seq=0; fi
+  mkdir -p "$(dirname "$cf")" 2>/dev/null || true
+  if [ "$cur_boot" != "$latest_boot" ]; then
+    printf '%s:%s\n' "$latest_boot" "$latest_seq" > "$cf"   # baseline, no replay
+    return 0
+  fi
+  jq -rc --arg boot "$latest_boot" --argjson cur "${cur_seq:-0}" \
+    'select(.name=="workspace.closed" and .boot_id==$boot and .seq > $cur) | .payload.workspace_id' \
+    "$f" 2>/dev/null
+  printf '%s:%s\n' "$latest_boot" "$latest_seq" > "$cf"
+}
