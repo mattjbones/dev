@@ -51,10 +51,11 @@ dc_teardown_one() {
   wt="$(dc_worktree_for_uuid "$uuid")"; [ -n "$wt" ] || return 0
   case "$wt" in "$HOME/workspace/"*) : ;; *) return 0 ;; esac   # only dev worktrees
   project="$(dc_project_for_worktree "$wt")"; [ -n "$project" ] || return 0
-  ( cd "$wt/docker" 2>/dev/null && docker compose -f docker-compose.dev.yml -p "$project" down ) >/dev/null 2>&1 || true
   base="$(basename "$wt")"; marker="$DEV_STATE_DIR/torn-down/$base"
-  mkdir -p "$DEV_STATE_DIR/torn-down" 2>/dev/null || true
-  printf '%s' "$project" > "$marker"
+  if ( cd "$wt/docker" 2>/dev/null && docker compose -f docker-compose.dev.yml -p "$project" down ) >/dev/null 2>&1; then
+    mkdir -p "$DEV_STATE_DIR/torn-down" 2>/dev/null || true
+    printf '%s' "$project" > "$marker"
+  fi
 }
 
 # Handle a batch of closed uuids. >=3 in one batch = cmux quit/crash → skip all.

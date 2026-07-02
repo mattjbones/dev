@@ -85,4 +85,21 @@ assert_eq "$(grep -c 'down' "$LOG")" "0" "bulk close (>=3) skipped"
 dc_handle_closes WS-UNKNOWN
 assert_eq "$(grep -c 'down' "$LOG")" "0" "unknown uuid ignored"
 
+# --- Task 4 fix: no marker when teardown fails (docker dir missing) ---
+: > "$LOG"
+echo "$HOME/workspace/nodir" > "$DEV_STATE_DIR/workspace-map/WS-NODIR"   # note: no docker/ dir created
+cat > "$STUB/docker" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$LOG"
+if [ "\$1" = "ps" ]; then
+  printf '%s' "\$*" | grep -q 'eng-7925-3/docker' && echo "matt-eng-7925-2-batches-at-conversion"
+  printf '%s' "\$*" | grep -q 'nodir/docker' && echo "nodir-project"
+fi
+exit 0
+EOF
+chmod +x "$STUB/docker"
+dc_teardown_one WS-NODIR
+[ -f "$DEV_STATE_DIR/torn-down/nodir" ] && st=exists || st=absent
+assert_eq "$st" "absent" "no marker when teardown cd fails"
+
 finish
