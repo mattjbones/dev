@@ -14,6 +14,15 @@ set -euo pipefail
 #                             chats resumable) to reclaim CPU/RAM. Guards: never
 #                             attached, never active within DEV_REAP_IDLE_HOURS
 #                             (default 24h), never the main lupa session.
+#   ./dev-ctl.sh auto-cleanup-dry   Preview merge-aware cleanup (removes nothing)
+#   ./dev-ctl.sh auto-cleanup       Remove worktrees + branches whose work has
+#                             LANDED (merged into main / PR MERGED). Guards: keeps
+#                             uncommitted, attached, live-agent, and (merged-but-no-PR)
+#                             within DEV_CLEANUP_GRACE_DAYS (default 7d). PRs closed
+#                             WITHOUT merging are KEPT by default.
+#                             Add --include-closed to also sweep CLOSED-unmerged PRs.
+#   ./dev-ctl.sh prune-branches     Delete orphaned local branches (merged / remote
+#                             gone; closed-unmerged kept). Add --include-closed too.
 #   ./dev-ctl.sh verify-main  Unshallow main lupa repo if needed (for worktrees)
 #
 # Keybindings (in fzf):
@@ -755,6 +764,9 @@ action_cleanup() {
 # Checks: remote gone, merged into main, PR merged/closed, or no PR and no worktree.
 action_prune_branches() {
   local dry_run="${1:-false}"
+  # Merged-only by default (see action_auto_cleanup). When false, a branch whose PR
+  # was CLOSED without merging is kept even if its remote branch is gone.
+  local include_closed="${2:-false}"
   printf "${DIM}Fetching and pruning remote refs...${NC}\n"
   git -C "$LUPA_REPO" fetch --prune --quiet origin 2>/dev/null || true
 
@@ -804,7 +816,11 @@ action_prune_branches() {
       local tracking pr_state
       tracking="$(git -C "$LUPA_REPO" for-each-ref --format='%(upstream:track)' "refs/heads/$branch" 2>/dev/null)"
       pr_state="$(gh pr list --repo "$GITHUB_REPO" --head "$branch" --state all --json state --jq '.[0].state' 2>/dev/null || echo "")"
-      if [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ]; then
+      if [ "$pr_state" = "CLOSED" ] && [ "$include_closed" = false ]; then
+        # Closed unmerged — keep it (even if the remote branch is gone), so
+        # merged-only cleanup never discards abandoned-but-maybe-wanted work.
+        reason=""
+      elif [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ]; then
         reason="PR $pr_state"
       elif [ "$tracking" = "[gone]" ]; then
         reason="remote gone"
@@ -913,6 +929,11 @@ action_rebase_all() {
 # Also prunes orphaned local branches.
 action_auto_cleanup() {
   local dry_run="${1:-false}"
+  # Merged-only by default: a worktree/branch is removed when its work has LANDED
+  # (branch merged into main, or PR MERGED). PRs closed WITHOUT merging are kept —
+  # that's abandoned-but-maybe-wanted work. Pass include_closed=true to also sweep
+  # CLOSED-unmerged PRs (the old merged-or-closed behaviour).
+  local include_closed="${2:-false}"
 
   printf "${DIM}Fetching latest from origin...${NC}\n"
   git -C "$LUPA_REPO" fetch --prune --quiet origin 2>/dev/null || true
@@ -1012,8 +1033,10 @@ action_auto_cleanup() {
     fi
 
     # PR status — only with a real branch (an empty --head makes `gh pr list`
-    # ignore the filter and return an unrelated newest PR).
-    local pr_closed=false
+    # ignore the filter and return an unrelated newest PR). Split the terminal
+    # states: MERGED counts as landed (folds into $merged); CLOSED-unmerged is
+    # tracked separately so merged-only mode can keep it.
+    local pr_closed_unmerged=false
     local pr_info pr_state pr_number pr_title
     pr_state=""; pr_number=""; pr_title=""
     if [ -n "$branch" ]; then
@@ -1022,8 +1045,10 @@ action_auto_cleanup() {
         pr_state="$(echo "$pr_info" | jq -r '.state // empty' 2>/dev/null)"
         pr_number="$(echo "$pr_info" | jq -r '.number // empty' 2>/dev/null)"
         pr_title="$(echo "$pr_info" | jq -r '.title // empty' 2>/dev/null)"
-        if [ "$pr_state" = "MERGED" ] || [ "$pr_state" = "CLOSED" ]; then
-          pr_closed=true
+        if [ "$pr_state" = "MERGED" ]; then
+          merged=true
+        elif [ "$pr_state" = "CLOSED" ]; then
+          pr_closed_unmerged=true
         fi
       fi
     fi
@@ -1032,7 +1057,7 @@ action_auto_cleanup() {
     # ancestry check flags as "merged into main" but with no terminal PR — i.e. an
     # in-flight branch with no commits/PR yet. A real MERGED/CLOSED PR is a
     # deliberate done-signal, so it's removed immediately regardless of age.
-    if [ "$merged" = true ] && [ "$pr_closed" = false ] && [ "$age_days" -lt "$grace_days" ]; then
+    if [ "$merged" = true ] && [ "$pr_state" != "MERGED" ] && [ "$pr_closed_unmerged" = false ] && [ "$age_days" -lt "$grace_days" ]; then
       printf "  ${GREEN}● Keep${NC}   ${BOLD}$wt_name${NC}\n"
       printf "           ${DIM}merged into main (no PR), but active ${age_days}d ago (< ${grace_days}d grace)${NC}\n"
       echo ""
@@ -1040,13 +1065,22 @@ action_auto_cleanup() {
       continue
     fi
 
-    if [ "$merged" = true ] || [ "$pr_closed" = true ]; then
+    # Remove when the work has landed (merged), or — only with --include-closed —
+    # when the PR was closed unmerged.
+    local remove_closed=false
+    if [ "$pr_closed_unmerged" = true ] && [ "$include_closed" = true ]; then
+      remove_closed=true
+    fi
+
+    if [ "$merged" = true ] || [ "$remove_closed" = true ]; then
       # Build reason
       local reason=""
-      [ "$merged" = true ] && reason="merged"
-      if [ "$pr_closed" = true ]; then
-        [ -n "$reason" ] && reason="$reason, "
-        reason="${reason}PR #${pr_number} ${pr_state}"
+      if [ "$merged" = true ]; then
+        reason="merged"
+        [ "$pr_state" = "MERGED" ] && reason="merged, PR #${pr_number} MERGED"
+      fi
+      if [ "$remove_closed" = true ]; then
+        reason="PR #${pr_number} CLOSED (unmerged)"
       fi
 
       if [ "$dry_run" = true ]; then
@@ -1054,8 +1088,8 @@ action_auto_cleanup() {
       else
         printf "  ${RED}✕ Removing${NC}      ${BOLD}$wt_name${NC}\n"
       fi
-      printf "           ${DIM}$reason${NC}\n"
-      [ -n "${pr_title:-}" ] && printf "           ${DIM}$pr_title${NC}\n"
+      printf "           ${DIM}%s${NC}\n" "$reason"
+      [ -n "${pr_title:-}" ] && printf "           ${DIM}%s${NC}\n" "$pr_title"
 
       if [ "$dry_run" = false ]; then
         # Use action_cleanup for thorough removal
@@ -1065,8 +1099,10 @@ action_auto_cleanup() {
       echo ""
     else
       printf "  ${GREEN}● Keep${NC}   ${BOLD}$wt_name${NC}\n"
-      if [ -n "${pr_number:-}" ]; then
-        printf "           ${DIM}PR #${pr_number}: ${pr_state} — ${pr_title}${NC}\n"
+      if [ "$pr_closed_unmerged" = true ]; then
+        printf "           ${DIM}PR #%s CLOSED unmerged — kept (use --include-closed to remove)${NC}\n" "$pr_number"
+      elif [ -n "${pr_number:-}" ]; then
+        printf "           ${DIM}PR #%s: %s — %s${NC}\n" "$pr_number" "$pr_state" "$pr_title"
       else
         printf "           ${DIM}no PR found${NC}\n"
       fi
@@ -1082,15 +1118,17 @@ action_auto_cleanup() {
     END { flush() }
   ')
 
-  # Prune orphaned branches (respects dry mode)
+  # Prune orphaned branches (respects dry mode + merged-only scope)
   printf "\n${BOLD}── Pruning orphaned branches ──${NC}\n"
-  action_prune_branches "$dry_run"
+  action_prune_branches "$dry_run" "$include_closed"
 
   echo ""
+  local scope="merged only"
+  [ "$include_closed" = true ] && scope="merged + closed"
   if [ "$dry_run" = true ]; then
-    printf "${YELLOW}Would remove $removed worktrees, keep $kept${NC}\n"
+    printf "${YELLOW}Would remove $removed worktrees, keep $kept${NC} ${DIM}(${scope})${NC}\n"
   else
-    printf "${GREEN}Removed $removed worktrees, kept $kept${NC}\n"
+    printf "${GREEN}Removed $removed worktrees, kept $kept${NC} ${DIM}(${scope})${NC}\n"
   fi
 }
 
@@ -1329,7 +1367,7 @@ case "${1:-}" in
     read -r -n 1
     ;;
   __auto_cleanup)
-    action_auto_cleanup "${2:-false}"
+    action_auto_cleanup "${2:-false}" "${3:-false}"
     echo ""
     echo "Press any key to continue..."
     read -r -n 1
@@ -1365,13 +1403,25 @@ case "${1:-}" in
     action_new "${2:-}"
     ;;
   prune-branches)
-    action_prune_branches
+    if [ "${2:-}" = "--include-closed" ]; then
+      action_prune_branches false true
+    else
+      action_prune_branches false
+    fi
     ;;
   auto-cleanup)
-    action_auto_cleanup false
+    if [ "${2:-}" = "--include-closed" ]; then
+      action_auto_cleanup false true
+    else
+      action_auto_cleanup false
+    fi
     ;;
   auto-cleanup-dry)
-    action_auto_cleanup true
+    if [ "${2:-}" = "--include-closed" ]; then
+      action_auto_cleanup true true
+    else
+      action_auto_cleanup true
+    fi
     ;;
   reap|reap-sessions)
     # Dry-run unless --apply: kill idle, unattached tmux sessions (freeing their
