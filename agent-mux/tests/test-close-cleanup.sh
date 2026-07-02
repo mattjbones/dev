@@ -115,4 +115,16 @@ assert_eq "$st" "gone" "marker cleared after re-up"
 dc_reup "$HOME/workspace/no-marker"
 assert_eq "$(grep -c 'up -d' "$LOG")" "0" "no marker → no-op"
 
+# --- Task 6: dc_tick end-to-end (drain → teardown) ---
+: > "$LOG"
+rm -f "$DEV_EVENTS_CURSOR"
+export DEV_CMUX_EVENTS_FILE="$STUB/tick-events.jsonl"
+cat > "$DEV_CMUX_EVENTS_FILE" <<'JSON'
+{"boot_id":"B9","seq":1,"name":"workspace.selected","payload":{}}
+JSON
+dc_tick   # baseline pass: no cursor yet → establishes baseline, no teardown
+echo '{"boot_id":"B9","seq":2,"name":"workspace.closed","payload":{"workspace_id":"WS-CLOSE"}}' >> "$DEV_CMUX_EVENTS_FILE"
+dc_tick   # should drain WS-CLOSE and tear down its project
+assert_eq "$(grep -c 'compose .*-p matt-eng-7925-2-batches-at-conversion down' "$LOG")" "1" "dc_tick drains + tears down"
+
 finish

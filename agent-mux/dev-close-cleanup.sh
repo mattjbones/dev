@@ -17,10 +17,21 @@ dc_project_for_worktree() {
             --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null | head -1
 }
 
-# Map a cmux workspace uuid -> worktree path via the registry dev.sh writes.
+# Map a cmux workspace uuid -> worktree path.
+# Primary: registry file dev.sh writes. Fallback: live tmux session env.
 dc_worktree_for_uuid() {
-  local uuid="$1" reg="$DEV_STATE_DIR/workspace-map/$1"
-  [ -f "$reg" ] && cat "$reg" || true
+  local uuid="$1" reg="$DEV_STATE_DIR/workspace-map/$1" s id cmd
+  if [ -f "$reg" ]; then cat "$reg"; return 0; fi
+  # Fallback: the tmux session is still alive (detached) at close time.
+  for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
+    id="$(tmux show-environment -t "$s" CMUX_WORKSPACE_ID 2>/dev/null | sed -n 's/^CMUX_WORKSPACE_ID=//p')"
+    if [ "$id" = "$uuid" ]; then
+      cmd="$(tmux show-options -t "$s" -qv @dev_title_cmd 2>/dev/null)"
+      # worktree is the 3rd double-quoted arg of the stored worker command
+      printf '%s\n' "$cmd" | sed -E 's/^([^"]*"[^"]*"){2} "([^"]*)".*/\2/'
+      return 0
+    fi
+  done
 }
 
 # Emit workspace_ids of new workspace.closed events since the cursor.
@@ -63,6 +74,15 @@ dc_handle_closes() {
   [ "$#" -gt 0 ] || return 0
   [ "$#" -ge 3 ] && { echo "dev-cleanup: bulk close ($# workspaces) — skipping teardown" >&2; return 0; }
   local u; for u in "$@"; do dc_teardown_one "$u"; done
+}
+
+# One daemon tick: drain new closes, handle them.
+dc_tick() {
+  local uuids
+  uuids="$(dc_drain_closed)" || return 0
+  [ -n "$uuids" ] || return 0
+  # shellcheck disable=SC2086
+  dc_handle_closes $uuids
 }
 
 # On reattach: if this worktree's docker was torn down on close, re-up it.
