@@ -44,3 +44,22 @@ dc_drain_closed() {
     "$f" 2>/dev/null
   printf '%s:%s\n' "$latest_boot" "$latest_seq" > "$cf"
 }
+
+# Tear down docker for one closed workspace uuid (guarded internals).
+dc_teardown_one() {
+  local uuid="$1" wt project base marker
+  wt="$(dc_worktree_for_uuid "$uuid")"; [ -n "$wt" ] || return 0
+  case "$wt" in "$HOME/workspace/"*) : ;; *) return 0 ;; esac   # only dev worktrees
+  project="$(dc_project_for_worktree "$wt")"; [ -n "$project" ] || return 0
+  ( cd "$wt/docker" 2>/dev/null && docker compose -f docker-compose.dev.yml -p "$project" down ) >/dev/null 2>&1 || true
+  base="$(basename "$wt")"; marker="$DEV_STATE_DIR/torn-down/$base"
+  mkdir -p "$DEV_STATE_DIR/torn-down" 2>/dev/null || true
+  printf '%s' "$project" > "$marker"
+}
+
+# Handle a batch of closed uuids. >=3 in one batch = cmux quit/crash → skip all.
+dc_handle_closes() {
+  [ "$#" -gt 0 ] || return 0
+  [ "$#" -ge 3 ] && { echo "dev-cleanup: bulk close ($# workspaces) — skipping teardown" >&2; return 0; }
+  local u; for u in "$@"; do dc_teardown_one "$u"; done
+}
