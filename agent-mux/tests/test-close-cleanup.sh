@@ -102,4 +102,17 @@ dc_teardown_one WS-NODIR
 [ -f "$DEV_STATE_DIR/torn-down/nodir" ] && st=exists || st=absent
 assert_eq "$st" "absent" "no marker when teardown cd fails"
 
+# --- Task 5: reattach re-up ---
+: > "$LOG"
+mkdir -p "$DEV_STATE_DIR/torn-down"
+echo "matt-eng-7925-2-batches-at-conversion" > "$DEV_STATE_DIR/torn-down/eng-7925-3"
+dc_reup "$HOME/workspace/eng-7925-3"
+assert_eq "$(grep -c 'compose .*-p matt-eng-7925-2-batches-at-conversion up -d' "$LOG")" "1" "re-ups stored project"
+[ -f "$DEV_STATE_DIR/torn-down/eng-7925-3" ] && st=exists || st=gone
+assert_eq "$st" "gone" "marker cleared after re-up"
+# no marker → no-op
+: > "$LOG"
+dc_reup "$HOME/workspace/no-marker"
+assert_eq "$(grep -c 'up -d' "$LOG")" "0" "no marker → no-op"
+
 finish

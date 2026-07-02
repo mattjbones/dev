@@ -64,3 +64,13 @@ dc_handle_closes() {
   [ "$#" -ge 3 ] && { echo "dev-cleanup: bulk close ($# workspaces) — skipping teardown" >&2; return 0; }
   local u; for u in "$@"; do dc_teardown_one "$u"; done
 }
+
+# On reattach: if this worktree's docker was torn down on close, re-up it.
+dc_reup() {
+  local wt="$1" base project marker
+  base="$(basename "$wt")"; marker="$DEV_STATE_DIR/torn-down/$base"
+  [ -f "$marker" ] || return 0
+  project="$(cat "$marker")"; [ -n "$project" ] || { rm -f "$marker"; return 0; }
+  ( cd "$wt/docker" 2>/dev/null && docker compose -f docker-compose.dev.yml -p "$project" up -d ) >/dev/null 2>&1 || true
+  rm -f "$marker"
+}
