@@ -169,6 +169,64 @@ fi
 assert_eq "$(grep -c 'action rename' "$LOG2")" "6" "renames all 6 headers (5 created + 1 healed)"
 
 # -----------------------------------------------------------------------
+# Test C: a short key that is a SUBSTRING of another workspace's title must
+# not collide onto that workspace's ref. Two keys resolving to one ref put a
+# duplicate in the --order list, which cmux rejects atomically (invalid_params:
+# Duplicate workspace in order) -> the whole reflect silently no-ops.
+# Regression: "review" was matching into "deploy-preview" (p-review).
+# -----------------------------------------------------------------------
+LOG3="$STUB/log3"; WS_FILE3="$STUB/workspaces3"
+cat > "$STUB/cmux3" <<EOF3
+#!/usr/bin/env bash
+echo "\$*" >> "$LOG3"
+case "\$1" in
+  list-workspaces)
+    # deploy-preview listed BEFORE review, so a substring matcher grabs it first.
+    echo "  workspace:70  ✳︎ deploy-preview 5%"
+    echo "  workspace:71  review"
+    [ -f "$WS_FILE3" ] && cat "$WS_FILE3" || true
+    ;;
+  new-workspace)
+    count=\$(wc -l < "$WS_FILE3" 2>/dev/null || echo 0)
+    ref="workspace:\$((count + 80))"
+    echo "  \$ref  Terminal \$((count + 80))" >> "$WS_FILE3"
+    echo "OK \$ref"
+    ;;
+  workspace-action)
+    ws=""; new_title=""
+    while [ \$# -gt 0 ]; do
+      case "\$1" in
+        --workspace) ws="\$2"; shift 2 ;;
+        --title) new_title="\$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [ -n "\$ws" ] && [ -n "\$new_title" ] && [ -f "$WS_FILE3" ]; then
+      sed -i.bak "s|  \$ws  .*|  \$ws  \$new_title|" "$WS_FILE3" && rm -f "${WS_FILE3}.bak"
+    fi
+    ;;
+esac
+EOF3
+chmod +x "$STUB/cmux3"
+
+export CMUX_BIN="$STUB/cmux3"
+RANKED_C='[{"key":"deploy-preview","tier":6},{"key":"review","tier":6}]'
+printf '%s' "$RANKED_C" | "$DIR/../dev-board-cmux.sh"
+
+ORDER_C="$(grep 'reorder-workspaces --order' "$LOG3" | head -1 | sed 's/.*--order //')"
+
+# review resolves to its OWN ref (workspace:71), not deploy-preview's (workspace:70)
+if printf '%s' "$ORDER_C" | tr ',' '\n' | grep -qx 'workspace:71'; then
+  pass
+else
+  fail "review must map to its own ref workspace:71, not collide onto deploy-preview"
+fi
+
+# no ref appears twice in the --order list (a duplicate makes cmux reject the batch)
+DUPES_C="$(printf '%s' "$ORDER_C" | tr ',' '\n' | sort | uniq -d | grep -c . || true)"
+assert_eq "$DUPES_C" "0" "--order list has no duplicate refs"
+
+# -----------------------------------------------------------------------
 # --- no-op when CMUX_BIN is non-executable ---
 # -----------------------------------------------------------------------
 (
