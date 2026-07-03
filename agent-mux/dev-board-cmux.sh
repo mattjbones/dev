@@ -92,15 +92,20 @@ ensure_headers() {
   done
 }
 
-# ref of the real workspace whose TITLE (the columns after the ref) contains key $1.
-# Normalizes the selected "* " prefix and never matches the ref token itself.
+# ref of the real workspace whose TITLE has key $1 as a whole space-delimited
+# field. Normalizes the selected "* " prefix and never matches the ref token
+# itself. Must be an EXACT field match, not a substring: cmux renders a dev row
+# as "<glyph> <branch-name> <pct>%" and branch names carry no spaces, so the key
+# is always one field. A substring match let a short key collide into a longer
+# title (e.g. "review" into "deploy-p<review>-with-affacted"), mapping two keys
+# to one ref -> a duplicate in the --order list, which cmux (>=0.64) rejects
+# atomically (invalid_params: Duplicate workspace in order), silently no-opping
+# the whole reflect.
 ref_for_key() {
   list_ws | awk -v k="$1" '
     { ref = ($1 == "*") ? $2 : $1
       start = ($1 == "*") ? 3 : 2
-      title = ""
-      for (j = start; j <= NF; j++) title = title (title == "" ? "" : " ") $j
-      if (index(title, k)) { print ref; exit }
+      for (j = start; j <= NF; j++) if ($j == k) { print ref; exit }
     }'
 }
 
@@ -129,7 +134,12 @@ main() {
   # leaves "prev" stale and every later item lands in the wrong tier block.
   # reorder-workspaces --order places the listed refs at indices 1..N together;
   # unlisted workspaces (e.g. this very session) keep their slot above them.
-  local order="${seq# }"; order="${order// /,}"
+  #
+  # Dedupe (first occurrence wins) before sending: cmux (>=0.64) rejects the
+  # WHOLE batch with invalid_params if any ref repeats, so one stray duplicate
+  # would silently no-op the entire reflect. ref_for_key should never produce a
+  # collision now, but this keeps a single bad row from freezing the board.
+  local order; order="$(printf '%s\n' $seq | awk 'NF && !seen[$0]++' | paste -sd, -)"
   [ -n "$order" ] && "$CMUX_BIN" reorder-workspaces --order "$order" >/dev/null 2>&1 || true
 }
 main
