@@ -24,7 +24,7 @@ case "$MODEL" in
     exec claude --dangerously-skip-permissions
     ;;
   codex)
-    exec codex --full-auto
+    exec codex --dangerously-bypass-approvals-and-sandbox
     ;;
   *)
     echo "Unknown model: $MODEL" >&2
