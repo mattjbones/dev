@@ -69,6 +69,10 @@ DEVCTL_PR_CACHE_FILE="${DEVCTL_PR_CACHE_FILE:-/tmp/dev-ctl/pr-cache.json}"
 DEVCTL_PR_CACHE_TTL="${DEVCTL_PR_CACHE_TTL:-30}"
 DEVCTL_INFO_CACHE_FILE="${DEVCTL_INFO_CACHE_FILE:-/tmp/dev-ctl/info-cache}"
 DEVCTL_INFO_CACHE_TTL="${DEVCTL_INFO_CACHE_TTL:-3}"
+# TTL for the inactive-worktree branch of preview_pane (see below). The live-tmux
+# branch is not cached at all — it was already fast and the pane content can change
+# every poll, so caching it only added staleness with no measured benefit.
+DEVCTL_PREVIEW_TTL="${DEVCTL_PREVIEW_TTL:-5}"
 
 # Fetch (and TTL-cache to disk) the batched `gh pr list` JSON used by
 # format_sessions. Pass "force" to bypass the cache and rewrite it.
@@ -313,10 +317,9 @@ list_deleting_workspaces() {
 }
 
 info_line() {
-  local non_actionable matched visible_total
+  local non_actionable matched visible_total age
   mkdir -p "$(dirname "$DEVCTL_INFO_CACHE_FILE")" 2>/dev/null || true
   if [ -f "$DEVCTL_INFO_CACHE_FILE" ]; then
-    local age
     age=$(( $(date +%s) - $(stat -f %m "$DEVCTL_INFO_CACHE_FILE" 2>/dev/null || echo 0) ))
   else
     age=999999
@@ -933,6 +936,9 @@ action_cleanup() {
   write_cleanup_status "$name" "Cleaning cache" "$cleanup_started_at"
   rm -f "/tmp/dev-tmux-title/${name}-tokens" 2>/dev/null || true
   rm -f "/tmp/dev-tmux-title/${name}-state-sig" 2>/dev/null || true
+  # Leftover preview_pane cache entry for this session name, so a reused name can't
+  # collide with a deleted worktree's stale preview.
+  rm -f "${DEVCTL_PREVIEW_DIR:-/tmp/dev-ctl/preview}/${name}".* 2>/dev/null || true
   # Clear the pills the (now-dead) poller last set — mirror dev-tmux-title.sh's keys.
   if [ -n "$cmux_ws_id" ] && [ -n "$cmux_bin" ]; then
     "$cmux_bin" clear-status build   --workspace "$cmux_ws_id" >/dev/null 2>&1 || true
@@ -1454,35 +1460,47 @@ action_verify_main() {
 
 preview_pane() {
   local session="$1"
-  local dir="${DEVCTL_PREVIEW_DIR:-/tmp/dev-ctl/preview}"
-  mkdir -p "$dir" 2>/dev/null || true
-  local sig="" sigfile="/tmp/dev-tmux-title/${session}-state-sig"
-  [ -f "$sigfile" ] && sig="$(cat "$sigfile" 2>/dev/null || true)"
-  local cache="$dir/${session}.$(printf '%s' "$sig" | { shasum 2>/dev/null || cksum; } | tr -cd '0-9a-f' | cut -c1-8)"
-  if [ -f "$cache" ]; then
-    cat "$cache"
+
+  # Live tmux session: never cache. This was already ~10ms (no measured benefit
+  # from caching it) and its pane content can change every poll, so caching it
+  # would only add staleness for free.
+  if tmux has-session -t "$session" 2>/dev/null; then
+    tmux capture-pane -t "$session:.0" -p -S -40 2>/dev/null || echo "(no pane content)"
     return
   fi
+
+  # Inactive worktree — this is the ~30-60ms-per-git-fork branch the cache exists
+  # to speed up. dev-tmux-title.sh's poller (and the state-sig file it writes) dies
+  # with the tmux session, so once a worktree is inactive that sig never changes
+  # again — keying the cache on it would serve the same preview indefinitely, even
+  # after the user commits/edits files outside tmux. Use a short TTL instead so a
+  # cached preview is at most DEVCTL_PREVIEW_TTL seconds stale.
+  local dir="${DEVCTL_PREVIEW_DIR:-/tmp/dev-ctl/preview}"
+  mkdir -p "$dir" 2>/dev/null || true
+  local cache="$dir/${session}.preview"
+  if [ -f "$cache" ]; then
+    local age
+    age=$(( $(date +%s) - $(stat -f %m "$cache" 2>/dev/null || echo 0) ))
+    if [ "$age" -ge 0 ] && [ "$age" -lt "$DEVCTL_PREVIEW_TTL" ]; then
+      cat "$cache"
+      return
+    fi
+  fi
   {
-    if tmux has-session -t "$session" 2>/dev/null; then
-      tmux capture-pane -t "$session:.0" -p -S -40 2>/dev/null || echo "(no pane content)"
+    local worktree="$HOME/workspace/$session"
+    if [ ! -d "$worktree" ]; then
+      # Check claude agent worktrees
+      worktree="$LUPA_REPO/.claude/worktrees/$session"
+    fi
+    if [ -d "$worktree" ]; then
+      echo "── Inactive worktree: $worktree ──"
+      echo ""
+      git -C "$worktree" log --oneline --no-decorate -10 2>/dev/null || true
+      echo ""
+      echo "── Status ──"
+      git -C "$worktree" status --short 2>/dev/null || true
     else
-      # Inactive worktree — show git log
-      local worktree="$HOME/workspace/$session"
-      if [ ! -d "$worktree" ]; then
-        # Check claude agent worktrees
-        worktree="$LUPA_REPO/.claude/worktrees/$session"
-      fi
-      if [ -d "$worktree" ]; then
-        echo "── Inactive worktree: $worktree ──"
-        echo ""
-        git -C "$worktree" log --oneline --no-decorate -10 2>/dev/null || true
-        echo ""
-        echo "── Status ──"
-        git -C "$worktree" status --short 2>/dev/null || true
-      else
-        echo "(worktree not found)"
-      fi
+      echo "(worktree not found)"
     fi
   } | tee "$cache" 2>/dev/null || true
 }
