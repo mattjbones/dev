@@ -1290,6 +1290,10 @@ preview_pane() {
 export SCRIPT_DIR CONFIG_DIR QUICK_ACTIONS DEV_TMUX LUPA_REPO
 export CLEANUP_STATE_DIR
 
+if [ "${DEVCTL_LIB:-}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 case "${1:-}" in
   # Internal commands used by fzf bindings
   __session_info)
