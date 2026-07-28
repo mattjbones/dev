@@ -938,7 +938,7 @@ action_cleanup() {
   rm -f "/tmp/dev-tmux-title/${name}-state-sig" 2>/dev/null || true
   # Leftover preview_pane cache entry for this session name, so a reused name can't
   # collide with a deleted worktree's stale preview.
-  rm -f "${DEVCTL_PREVIEW_DIR:-/tmp/dev-ctl/preview}/${name}".* 2>/dev/null || true
+  rm -f "${DEVCTL_PREVIEW_DIR:-/tmp/dev-ctl/preview}/${name}.preview" 2>/dev/null || true
   # Clear the pills the (now-dead) poller last set — mirror dev-tmux-title.sh's keys.
   if [ -n "$cmux_ws_id" ] && [ -n "$cmux_bin" ]; then
     "$cmux_bin" clear-status build   --workspace "$cmux_ws_id" >/dev/null 2>&1 || true
