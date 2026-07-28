@@ -681,6 +681,18 @@ action_cleanup() {
 
   echo "Cleaning up '$name'..."
 
+  # Resolve the cmux CLI + this session's workspace id BEFORE we kill tmux (step 2).
+  # The pill-owning poller (dev-tmux-title.sh) dies with the session, so its last-set
+  # sidebar pill (📖 storybook / 🐳 docker / context gauge) would otherwise freeze onto
+  # the orphaned row — nothing else ever clears it. The id lives in the tmux session env
+  # and is unrecoverable once the session is gone, so capture it here, clear pills later.
+  local cmux_bin="" cmux_ws_id=""
+  cmux_bin="$(command -v cmux 2>/dev/null || true)"
+  if [ -z "$cmux_bin" ] && [ -x "/Applications/cmux.app/Contents/Resources/bin/cmux" ]; then
+    cmux_bin="/Applications/cmux.app/Contents/Resources/bin/cmux"
+  fi
+  cmux_ws_id="$(tmux show-environment -t "$name" CMUX_WORKSPACE_ID 2>/dev/null | sed -n 's/^CMUX_WORKSPACE_ID=//p' || true)"
+
   # Resolve worktree before docker/tmux so compose -f path and working_dir labels match
   local worktree=""
   worktree="$(resolve_workspace_worktree "$name" 2>/dev/null || true)"
@@ -723,9 +735,17 @@ action_cleanup() {
   write_cleanup_status "$name" "Cleaning logs" "$cleanup_started_at"
   rm -f "$LUPA_REPO/.vite-${name}.log" 2>/dev/null || true
 
-  # 6. Token cache
+  # 6. Title subsystem: token cache + state-sig, and the now-orphaned cmux pills.
   write_cleanup_status "$name" "Cleaning cache" "$cleanup_started_at"
   rm -f "/tmp/dev-tmux-title/${name}-tokens" 2>/dev/null || true
+  rm -f "/tmp/dev-tmux-title/${name}-state-sig" 2>/dev/null || true
+  # Clear the pills the (now-dead) poller last set — mirror dev-tmux-title.sh's keys.
+  if [ -n "$cmux_ws_id" ] && [ -n "$cmux_bin" ]; then
+    "$cmux_bin" clear-status build   --workspace "$cmux_ws_id" >/dev/null 2>&1 || true
+    "$cmux_bin" clear-status agent   --workspace "$cmux_ws_id" >/dev/null 2>&1 || true
+    "$cmux_bin" clear-status context --workspace "$cmux_ws_id" >/dev/null 2>&1 || true
+    "$cmux_bin" clear-progress       --workspace "$cmux_ws_id" >/dev/null 2>&1 || true
+  fi
 
   # 7. Prune any dangling worktree references
   write_cleanup_status "$name" "Pruning worktrees" "$cleanup_started_at"
