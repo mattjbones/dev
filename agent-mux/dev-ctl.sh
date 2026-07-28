@@ -23,6 +23,9 @@ set -euo pipefail
 #                             Add --include-closed to also sweep CLOSED-unmerged PRs.
 #   ./dev-ctl.sh prune-branches     Delete orphaned local branches (merged / remote
 #                             gone; closed-unmerged kept). Add --include-closed too.
+#   ./dev-ctl.sh prune-docker       Preview orphaned docker projects (no matching
+#                             worktree) — dry-run, removes nothing. Add --apply to
+#                             actually remove their containers/volumes/images.
 #   ./dev-ctl.sh verify-main  Unshallow main lupa repo if needed (for worktrees)
 #
 # Keybindings (in fzf):
@@ -662,6 +665,44 @@ devctl_orphan_projects() {
     if printf '%s\n' "$live" | grep -qxF "$p"; then continue; fi
     printf '%s\n' "$p"
   done
+}
+
+# Remove all docker resources for one compose project (by label).
+devctl_purge_project() { # <project>
+  local proj="$1" ids
+  ids="$(docker ps -a -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null | tr '\n' ' ')" || true
+  # shellcheck disable=SC2086
+  [ -n "$ids" ] && docker rm -f $ids 2>/dev/null || true
+  local v
+  for v in $(docker volume ls -q 2>/dev/null || true); do
+    if [ "$(docker volume inspect "$v" --format '{{index .Labels "com.docker.compose.project"}}' 2>/dev/null || true)" = "$proj" ]; then
+      docker volume rm "$v" 2>/dev/null || true
+    fi
+  done
+  local img
+  for img in $(docker images -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null || true); do
+    docker image rm "$img" 2>/dev/null || true
+  done
+}
+
+action_prune_docker() { # <dry_run> [keepers-newline]
+  local dry_run="${1:-true}" keepers="${2:-}"
+  local orphans; orphans="$(devctl_orphan_projects)" || true
+  if [ -z "$orphans" ]; then echo "No orphaned docker projects found."; return 0; fi
+  local p
+  echo "Orphaned docker projects (no matching worktree):"
+  printf '%s\n' "$orphans" | while IFS= read -r p; do [ -n "$p" ] && echo "  ○ $p"; done
+  if [ "$dry_run" = "true" ]; then
+    echo "(dry-run — re-run with --apply to remove, or use the select gate)"
+    return 0
+  fi
+  printf '%s\n' "$orphans" | while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    if [ -n "$keepers" ] && printf '%s\n' "$keepers" | grep -qxF "$p"; then continue; fi
+    echo "  ✕ purging $p"
+    devctl_purge_project "$p"
+  done
+  docker image prune -f >/dev/null 2>&1 || true
 }
 
 action_attach() {
@@ -1504,6 +1545,13 @@ case "${1:-}" in
       action_auto_cleanup false true
     else
       action_auto_cleanup false
+    fi
+    ;;
+  prune-docker)
+    if [ "${2:-}" = "--apply" ]; then
+      action_prune_docker false
+    else
+      action_prune_docker true
     fi
     ;;
   auto-cleanup-dry)
