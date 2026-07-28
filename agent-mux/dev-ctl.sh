@@ -65,6 +65,27 @@ DEV_TMUX="$SCRIPT_DIR/dev.sh"
 LUPA_REPO="$HOME/workspace/lupa"
 GITHUB_REPO="${DEV_CTL_GITHUB_REPO:-LupaPets/lupa}"
 CLEANUP_STATE_DIR="/tmp/dev-ctl-cleanup"
+DEVCTL_PR_CACHE_FILE="${DEVCTL_PR_CACHE_FILE:-/tmp/dev-ctl/pr-cache.json}"
+DEVCTL_PR_CACHE_TTL="${DEVCTL_PR_CACHE_TTL:-30}"
+
+# Fetch (and TTL-cache to disk) the batched `gh pr list` JSON used by
+# format_sessions. Pass "force" to bypass the cache and rewrite it.
+load_pr_cache() { # [force]
+  local force="${1:-}"
+  mkdir -p "$(dirname "$DEVCTL_PR_CACHE_FILE")" 2>/dev/null || true
+  if [ "$force" != "force" ] && [ -f "$DEVCTL_PR_CACHE_FILE" ]; then
+    local age
+    age=$(( $(date +%s) - $(stat -f %m "$DEVCTL_PR_CACHE_FILE" 2>/dev/null || echo 0) ))
+    if [ "$age" -ge 0 ] && [ "$age" -lt "$DEVCTL_PR_CACHE_TTL" ]; then
+      cat "$DEVCTL_PR_CACHE_FILE"
+      return 0
+    fi
+  fi
+  local json
+  json="$(gh pr list --repo "$GITHUB_REPO" --state all --limit 400 --json headRefName,state,number 2>/dev/null || echo '[]')"
+  printf '%s' "$json" > "$DEVCTL_PR_CACHE_FILE"
+  printf '%s' "$json"
+}
 
 # ---------------------------------------------------------------------------
 # Colours
@@ -456,9 +477,7 @@ list_orphaned_sessions() {
 # Format session list for fzf display.
 format_sessions() {
   if command -v gh &>/dev/null && command -v jq &>/dev/null; then
-    DEV_CTL_PR_CACHE="$(
-      gh pr list --repo "$GITHUB_REPO" --state all --limit 400 --json headRefName,state,number 2>/dev/null || echo '[]'
-    )"
+    DEV_CTL_PR_CACHE="$(load_pr_cache "${DEVCTL_FORCE_REFRESH:-}")"
   else
     DEV_CTL_PR_CACHE="[]"
   fi
@@ -1638,7 +1657,7 @@ case "${1:-}" in
       --bind="ctrl-k:execute($SELF __reap_sessions)+reload($SELF __list)" \
       --bind="ctrl-g:execute($SELF __auto_cleanup)+reload($SELF __list)" \
       --bind="ctrl-b:execute($SELF __prune_branches)+reload($SELF __list)" \
-      --bind="ctrl-r:reload($SELF __list)" \
+      --bind="ctrl-r:reload(DEVCTL_FORCE_REFRESH=force $SELF __list)" \
     || true)"
 
     # Act on selection after fzf has exited and tty is free
