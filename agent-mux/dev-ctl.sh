@@ -67,6 +67,8 @@ GITHUB_REPO="${DEV_CTL_GITHUB_REPO:-LupaPets/lupa}"
 CLEANUP_STATE_DIR="/tmp/dev-ctl-cleanup"
 DEVCTL_PR_CACHE_FILE="${DEVCTL_PR_CACHE_FILE:-/tmp/dev-ctl/pr-cache.json}"
 DEVCTL_PR_CACHE_TTL="${DEVCTL_PR_CACHE_TTL:-30}"
+DEVCTL_INFO_CACHE_FILE="${DEVCTL_INFO_CACHE_FILE:-/tmp/dev-ctl/info-cache}"
+DEVCTL_INFO_CACHE_TTL="${DEVCTL_INFO_CACHE_TTL:-3}"
 
 # Fetch (and TTL-cache to disk) the batched `gh pr list` JSON used by
 # format_sessions. Pass "force" to bypass the cache and rewrite it.
@@ -311,10 +313,29 @@ list_deleting_workspaces() {
 }
 
 info_line() {
-  local inactive_count deleting_count non_actionable matched visible_total
-  inactive_count="$(count_inactive_worktrees)"
-  deleting_count="$(count_deleting_workspaces)"
-  non_actionable=$(( inactive_count + deleting_count ))
+  local non_actionable matched visible_total
+  mkdir -p "$(dirname "$DEVCTL_INFO_CACHE_FILE")" 2>/dev/null || true
+  if [ -f "$DEVCTL_INFO_CACHE_FILE" ]; then
+    local age
+    age=$(( $(date +%s) - $(stat -f %m "$DEVCTL_INFO_CACHE_FILE" 2>/dev/null || echo 0) ))
+  else
+    age=999999
+  fi
+  if [ -f "$DEVCTL_INFO_CACHE_FILE" ] && [ "$age" -ge 0 ] && [ "$age" -lt "$DEVCTL_INFO_CACHE_TTL" ]; then
+    non_actionable="$(cat "$DEVCTL_INFO_CACHE_FILE" 2>/dev/null || echo 0)"
+  else
+    # count_inactive_worktrees forks basename/grep once per worktree (can be
+    # hundreds on this machine) and is the expensive part of this function —
+    # see profiling numbers in the commit message. fzf calls info_line on
+    # essentially every keystroke, so this is TTL-cached rather than re-run
+    # per keystroke; the worktree/cleanup list rarely changes within a few
+    # seconds, so a short TTL keeps it fresh without the per-keystroke cost.
+    local inactive_count deleting_count
+    inactive_count="$(count_inactive_worktrees)"
+    deleting_count="$(count_deleting_workspaces)"
+    non_actionable=$(( inactive_count + deleting_count ))
+    printf '%s' "$non_actionable" > "$DEVCTL_INFO_CACHE_FILE" 2>/dev/null || true
+  fi
 
   matched="${FZF_MATCH_COUNT:-0}"
   visible_total="${FZF_TOTAL_COUNT:-0}"
@@ -1433,26 +1454,37 @@ action_verify_main() {
 
 preview_pane() {
   local session="$1"
-  if tmux has-session -t "$session" 2>/dev/null; then
-    tmux capture-pane -t "$session:.0" -p -S -40 2>/dev/null || echo "(no pane content)"
-  else
-    # Inactive worktree — show git log
-    local worktree="$HOME/workspace/$session"
-    if [ ! -d "$worktree" ]; then
-      # Check claude agent worktrees
-      worktree="$LUPA_REPO/.claude/worktrees/$session"
-    fi
-    if [ -d "$worktree" ]; then
-      echo "── Inactive worktree: $worktree ──"
-      echo ""
-      git -C "$worktree" log --oneline --no-decorate -10 2>/dev/null || true
-      echo ""
-      echo "── Status ──"
-      git -C "$worktree" status --short 2>/dev/null || true
-    else
-      echo "(worktree not found)"
-    fi
+  local dir="${DEVCTL_PREVIEW_DIR:-/tmp/dev-ctl/preview}"
+  mkdir -p "$dir" 2>/dev/null || true
+  local sig="" sigfile="/tmp/dev-tmux-title/${session}-state-sig"
+  [ -f "$sigfile" ] && sig="$(cat "$sigfile" 2>/dev/null || true)"
+  local cache="$dir/${session}.$(printf '%s' "$sig" | { shasum 2>/dev/null || cksum; } | tr -cd '0-9a-f' | cut -c1-8)"
+  if [ -f "$cache" ]; then
+    cat "$cache"
+    return
   fi
+  {
+    if tmux has-session -t "$session" 2>/dev/null; then
+      tmux capture-pane -t "$session:.0" -p -S -40 2>/dev/null || echo "(no pane content)"
+    else
+      # Inactive worktree — show git log
+      local worktree="$HOME/workspace/$session"
+      if [ ! -d "$worktree" ]; then
+        # Check claude agent worktrees
+        worktree="$LUPA_REPO/.claude/worktrees/$session"
+      fi
+      if [ -d "$worktree" ]; then
+        echo "── Inactive worktree: $worktree ──"
+        echo ""
+        git -C "$worktree" log --oneline --no-decorate -10 2>/dev/null || true
+        echo ""
+        echo "── Status ──"
+        git -C "$worktree" status --short 2>/dev/null || true
+      else
+        echo "(worktree not found)"
+      fi
+    fi
+  } | tee "$cache" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
