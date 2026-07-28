@@ -175,6 +175,8 @@ session_info() {
   local session="$1"
   local cleanup_status=""
 
+  [ -z "${DEVCTL_PR_MAP+x}" ] && devctl_build_render_lookups
+
   cleanup_status="$(format_cleanup_status "$session" || true)"
   if [ -n "$cleanup_status" ]; then
     printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$session" "⌛" " " " " "—" "$cleanup_status"
@@ -394,11 +396,31 @@ worktree_path_for_session() {
   return 1
 }
 
-# One-line PR state + whether the branch is merged into main (git), using batched gh JSON in DEV_CTL_PR_CACHE.
+# Build once-per-render lookups consulted by pr_merge_summary_for_branch, so
+# that listing many sessions doesn't fork `git branch --merged`/`jq` per row.
+# Produces:
+#   DEVCTL_MERGED_SET — newline-separated set of branch names merged into main
+#   DEVCTL_PR_MAP     — lines of `branch<TAB>STATE #num` (highest PR number per branch)
+# Consumes DEV_CTL_PR_CACHE (JSON array) set by format_sessions.
+devctl_build_render_lookups() {
+  DEVCTL_MERGED_SET="$(
+    { git -C "$LUPA_REPO" branch --merged main 2>/dev/null | sed 's/^[*+ ]*//'
+      git -C "$LUPA_REPO" branch -r --merged origin/main 2>/dev/null | sed 's#^[*+ ]*origin/##'
+    } | grep . | sort -u || true
+  )"
+  DEVCTL_PR_MAP="$(
+    printf '%s' "${DEV_CTL_PR_CACHE:-[]}" | jq -r '
+      sort_by(.number) | .[] | "\(.headRefName)\t\(.state) #\(.number)"' 2>/dev/null \
+    | awk -F'\t' '{m[$1]=$2} END{for(k in m) print k"\t"m[k]}' || true
+  )"
+  export DEVCTL_MERGED_SET DEVCTL_PR_MAP
+}
+
+# One-line PR state + whether the branch is merged into main, using the
+# once-per-render lookups DEVCTL_PR_MAP / DEVCTL_MERGED_SET built by
+# devctl_build_render_lookups. Does NOT fork git/jq itself.
 pr_merge_summary_for_branch() {
-  local branch="$1"
-  local cache="${DEV_CTL_PR_CACHE:-[]}"
-  local pr_line merged_local=""
+  local branch="$1" pr_line="" merged_local=""
 
   if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
     printf '%s\n' "—"
@@ -409,18 +431,8 @@ pr_merge_summary_for_branch() {
     return
   fi
 
-  if command -v jq &>/dev/null; then
-    pr_line="$(
-      printf '%s' "$cache" | jq -r --arg b "$branch" '
-        [.[] | select(.headRefName == $b)] | sort_by(.number) | reverse | .[0]
-        | if . == null then empty else "\(.state) #\(.number)" end
-      ' 2>/dev/null || true
-    )"
-  fi
-
-  if git -C "$LUPA_REPO" branch --merged main 2>/dev/null | grep -qw "$branch"; then
-    merged_local=1
-  elif git -C "$LUPA_REPO" branch -r --merged origin/main 2>/dev/null | grep -qw "origin/$branch"; then
+  pr_line="$(printf '%s\n' "${DEVCTL_PR_MAP:-}" | awk -F'\t' -v b="$branch" '$1==b{print $2; exit}')"
+  if printf '%s\n' "${DEVCTL_MERGED_SET:-}" | grep -qxF "$branch"; then
     merged_local=1
   fi
 
@@ -482,6 +494,7 @@ format_sessions() {
     DEV_CTL_PR_CACHE="[]"
   fi
   export DEV_CTL_PR_CACHE
+  devctl_build_render_lookups
 
   local orphaned
   orphaned="$(list_orphaned_sessions)"
