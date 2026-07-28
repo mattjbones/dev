@@ -685,6 +685,15 @@ devctl_purge_project() { # <project>
   done
 }
 
+devctl_removal_after_keepers() { # <candidates-nl> <keepers-nl>
+  local candidates="$1" keepers="${2:-}" p
+  printf '%s\n' "$candidates" | while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    if [ -n "$keepers" ] && printf '%s\n' "$keepers" | grep -qxF "$p"; then continue; fi
+    printf '%s\n' "$p"
+  done
+}
+
 action_prune_docker() { # <dry_run> [keepers-newline]
   local dry_run="${1:-true}" keepers="${2:-}"
   local orphans; orphans="$(devctl_orphan_projects)" || true
@@ -692,8 +701,20 @@ action_prune_docker() { # <dry_run> [keepers-newline]
   local p
   echo "Orphaned docker projects (no matching worktree):"
   printf '%s\n' "$orphans" | while IFS= read -r p; do [ -n "$p" ] && echo "  ○ $p"; done
-  if [ "$dry_run" = "true" ]; then
-    echo "(dry-run — re-run with --apply to remove, or use the select gate)"
+  if [ "$dry_run" = "true" ] && [ -t 0 ]; then
+    printf 'Remove these? [y]es / [n]o / [s]elect keepers: '
+    read -r reply
+    case "$reply" in
+      y|Y) dry_run=false; keepers="" ;;
+      s|S)
+        keepers="$(printf '%s\n' "$orphans" | fzf --multi \
+          --header='TAB = keep (spare from removal); Enter to proceed' \
+          --prompt='keep > ' || true)"
+        dry_run=false ;;
+      *) echo "Aborted."; return 0 ;;
+    esac
+  elif [ "$dry_run" = "true" ]; then
+    echo "(dry-run — re-run with --apply to remove)"
     return 0
   fi
   printf '%s\n' "$orphans" | while IFS= read -r p; do
