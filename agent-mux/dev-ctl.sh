@@ -632,10 +632,10 @@ devctl_live_projects() {
     /^branch /{ sub("refs/heads/","",$2); print "B:" $2 }
   ' | while IFS= read -r line; do
     case "$line" in
-      B:*) norm_branch_project "${line#B:}" ;;
-      *)   base="$line"; printf '%s\n%s\n' "$base" "$(norm_project "$base")" ;;
+      B:*) norm_branch_project "${line#B:}" 2>/dev/null || true ;;
+      *)   base="$line"; printf '%s\n%s\n' "$base" "$(norm_project "$base" 2>/dev/null || true)" ;;
     esac
-  done | grep . | sort -u
+  done | grep . | sort -u || true
 }
 
 devctl_is_infra() { # <project>
@@ -650,7 +650,7 @@ devctl_all_projects() {
       docker volume inspect "$v" --format '{{index .Labels "com.docker.compose.project"}}' 2>/dev/null
     done
     docker ps -a --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null
-  } | grep -vE '^$|<no value>' | sort -u
+  } | grep -vE '^$|<no value>' | sort -u || true
 }
 
 devctl_orphan_projects() {
