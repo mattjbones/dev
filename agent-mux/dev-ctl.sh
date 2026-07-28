@@ -45,6 +45,17 @@ while [ -h "$_dctl_source" ]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$_dctl_source")" && pwd)"
 unset _dctl_source _dctl_dir _dctl_link
+
+# Compose project normalisation — MUST mirror docker/docker-start.sh.
+norm_project() { # <name> -> compose project (name stage)
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g'
+}
+norm_branch_project() { # <branch> -> compose project (branch stage then name stage)
+  local b
+  b="$(printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g' | tr '[:upper:]' '[:lower:]' | sed 's/^claude-slack-//')"
+  norm_project "$b"
+}
+
 CONFIG_DIR="$HOME/.config/dev-ctl"
 QUICK_ACTIONS="$CONFIG_DIR/quick-actions.txt"
 DEV_TMUX="$SCRIPT_DIR/dev.sh"
