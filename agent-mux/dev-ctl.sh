@@ -581,11 +581,13 @@ docker_down_for_workspace() {
   [ "$mode" = "purge" ] && rmi="--rmi local"
 
   local name_norm branch_proj=""
-  name_norm="$(norm_project "$name")"
+  name_norm="$(norm_project "$name" 2>/dev/null || true)"
   if [ -n "$worktree" ] && [ -d "$worktree" ]; then
     local br
     br="$(git -C "$worktree" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-    [ -n "$br" ] && branch_proj="$(norm_branch_project "$br")"
+    if [ -n "$br" ]; then
+      branch_proj="$(norm_branch_project "$br" 2>/dev/null || true)"
+    fi
   fi
 
   local proj ids
