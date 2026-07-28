@@ -83,7 +83,7 @@ load_pr_cache() { # [force]
   fi
   local json
   json="$(gh pr list --repo "$GITHUB_REPO" --state all --limit 400 --json headRefName,state,number 2>/dev/null || echo '[]')"
-  printf '%s' "$json" > "$DEVCTL_PR_CACHE_FILE"
+  printf '%s' "$json" > "$DEVCTL_PR_CACHE_FILE" 2>/dev/null || true
   printf '%s' "$json"
 }
 

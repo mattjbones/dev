@@ -18,4 +18,10 @@ load_pr_cache >/dev/null
 assert_eq "$(wc -l < "$GH_LOG" | tr -d ' ')" "1" "second call within TTL is cached"
 load_pr_cache force >/dev/null
 assert_eq "$(wc -l < "$GH_LOG" | tr -d ' ')" "2" "force refresh re-invokes gh"
+
+# Once the TTL has actually elapsed, load_pr_cache should re-invoke gh even
+# without "force" -- backdate the cache file's mtime past the TTL window.
+touch -t "$(date -v-1H +%Y%m%d%H%M.%S)" "$DEVCTL_PR_CACHE_FILE"
+load_pr_cache >/dev/null
+assert_eq "$(wc -l < "$GH_LOG" | tr -d ' ')" "3" "expired TTL re-invokes gh without force"
 finish
