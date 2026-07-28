@@ -192,8 +192,8 @@ session_info() {
   # Docker status
   local docker_icon=""
   local compose_project
-  # Mirror docker-start.sh's compose project normalisation (lowercase, non [a-z0-9_-] -> '-')
-  compose_project="$(printf '%s' "$session" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/--*/-/g')"
+  # Mirror docker-start.sh's compose project normalisation via the shared helper.
+  compose_project="$(norm_project "$session")"
   local worktree="$HOME/workspace/$session"
   if docker ps --filter "label=com.docker.compose.project=$compose_project" --filter "status=running" -q 2>/dev/null | grep -q .; then
     docker_icon="🐳"
@@ -709,11 +709,28 @@ devctl_all_projects() {
       docker volume inspect "$v" --format '{{index .Labels "com.docker.compose.project"}}' 2>/dev/null
     done
     docker ps -a --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null
+    # Images: this is the source that reclaims the historical ~111GB backlog.
+    # Worktrees torn down by the OLD (pre-cleanup) teardown ran
+    # `down --volumes` with no `--rmi`, so for those, the volume and
+    # container are long gone and only a tagged compose image remains — with
+    # no volume/container left to discover it via the two sources above.
+    # NB: `docker images --format '{{.Label "..."}}'` errors on this docker
+    # CLI's image formatter context (no `.Label` method for images, unlike
+    # the container/ps context used above) — verified empirically. Use
+    # `image inspect`'s Config.Labels instead, mirroring the volume-inspect
+    # pattern above.
+    docker images --filter "label=com.docker.compose.project" -q 2>/dev/null | sort -u | while IFS= read -r i; do
+      docker image inspect "$i" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null
+    done
   } | grep -vE '^$|<no value>' | sort -u || true
 }
 
 devctl_orphan_projects() {
   local live; live="$(devctl_live_projects)"
+  if [ -z "$live" ]; then
+    echo "devctl_orphan_projects: empty live-set (git worktree list failed?) — refusing to compute orphans" >&2
+    return 1
+  fi
   local p
   devctl_all_projects | while IFS= read -r p; do
     [ -z "$p" ] && continue
