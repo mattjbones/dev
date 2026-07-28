@@ -619,6 +619,51 @@ docker_down_for_workspace() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Live-set + orphan-project detection (used by prune-docker reconciliation).
+# Safety direction: when in doubt, KEEP. A too-large live-set only risks
+# leaving an orphan behind; a too-small one risks deleting a live worktree's
+# DB. Never invert this.
+# ---------------------------------------------------------------------------
+
+devctl_live_projects() {
+  git -C "$LUPA_REPO" worktree list --porcelain 2>/dev/null | awk '
+    /^worktree /{ n=split($2,a,"/"); base=a[n]; print base; wt=1 }
+    /^branch /{ sub("refs/heads/","",$2); print "B:" $2 }
+  ' | while IFS= read -r line; do
+    case "$line" in
+      B:*) norm_branch_project "${line#B:}" ;;
+      *)   base="$line"; printf '%s\n%s\n' "$base" "$(norm_project "$base")" ;;
+    esac
+  done | grep . | sort -u
+}
+
+devctl_is_infra() { # <project>
+  case "$1" in
+    lupa-proxy|supabase_*|supabase-*|buildx_buildkit_*|buildkit*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+devctl_all_projects() {
+  { docker volume ls -q 2>/dev/null | while IFS= read -r v; do
+      docker volume inspect "$v" --format '{{index .Labels "com.docker.compose.project"}}' 2>/dev/null
+    done
+    docker ps -a --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null
+  } | grep -vE '^$|<no value>' | sort -u
+}
+
+devctl_orphan_projects() {
+  local live; live="$(devctl_live_projects)"
+  local p
+  devctl_all_projects | while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    if devctl_is_infra "$p"; then continue; fi
+    if printf '%s\n' "$live" | grep -qxF "$p"; then continue; fi
+    printf '%s\n' "$p"
+  done
+}
+
 action_attach() {
   local session="$1"
   # If no active tmux session, create one via dev-tmux (without attaching)
