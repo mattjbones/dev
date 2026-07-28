@@ -52,7 +52,7 @@ norm_project() { # <name> -> compose project (name stage)
 }
 norm_branch_project() { # <branch> -> compose project (branch stage then name stage)
   local b
-  b="$(printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g' | tr '[:upper:]' '[:lower:]' | sed 's/^claude-slack-//')"
+  b="$(printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g' | tr '[:upper:]' '[:lower:]' | sed 's/^claude-slack-//' || true)"
   norm_project "$b"
 }
 
