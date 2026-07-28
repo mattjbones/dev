@@ -54,7 +54,7 @@ devctl_orphan_projects() { printf '%s\n' old-branch dead-wt; }
 
 # dry-run removes nothing (container, volume, or image)
 : > "$RM_LOG"
-action_prune_docker true >/dev/null 2>&1 || true
+action_prune_docker true </dev/null >/dev/null 2>&1 || true
 assert_eq "$(wc -l < "$RM_LOG" | tr -d ' ')" "0" "dry-run removes nothing"
 
 # apply removes both orphans, across all three docker resource types

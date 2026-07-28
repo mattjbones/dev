@@ -707,9 +707,22 @@ action_prune_docker() { # <dry_run> [keepers-newline]
     case "$reply" in
       y|Y) dry_run=false; keepers="" ;;
       s|S)
+        # Capture fzf's real exit code via `|| fzf_rc=$?` rather than a
+        # trailing `|| true` on the assignment: under `set -e` (top of this
+        # script), `keepers="$(... | fzf ...)"` with no guard at all would
+        # abort the *whole script* the instant fzf exits non-zero (e.g. 130
+        # on Esc/Ctrl-C) — the failure trips -e before this line's `$?`
+        # capture would ever run. `|| fzf_rc=$?` keeps the assignment inside
+        # an OR-list (exempt from -e) while still recording fzf's real exit
+        # status (pipefail makes the pipeline's status fzf's own).
+        local fzf_rc=0
         keepers="$(printf '%s\n' "$orphans" | fzf --multi \
           --header='TAB = keep (spare from removal); Enter to proceed' \
-          --prompt='keep > ' || true)"
+          --prompt='keep > ')" || fzf_rc=$?
+        if [ "$fzf_rc" -ne 0 ]; then
+          echo "Aborted."
+          return 0
+        fi
         dry_run=false ;;
       *) echo "Aborted."; return 0 ;;
     esac
