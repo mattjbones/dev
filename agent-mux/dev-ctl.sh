@@ -570,24 +570,32 @@ resolve_workspace_worktree() {
 docker_down_for_workspace() {
   local name="$1"
   local worktree="${2:-}"
+  local mode="${3:-stop}"
   local compose_file="$LUPA_REPO/docker/docker-compose.dev.yml"
 
   if [ -n "$worktree" ] && [ -f "$worktree/docker/docker-compose.dev.yml" ]; then
     compose_file="$worktree/docker/docker-compose.dev.yml"
   fi
 
-  local name_lc name_norm
-  name_lc="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
-  # docker-start.sh normalises further: non [a-z0-9_-] chars become '-'
-  name_norm="$(printf '%s' "$name_lc" | sed 's/[^a-z0-9_-]/-/g; s/--*/-/g')"
+  local rmi=""
+  [ "$mode" = "purge" ] && rmi="--rmi local"
+
+  local name_norm branch_proj=""
+  name_norm="$(norm_project "$name")"
+  if [ -n "$worktree" ] && [ -d "$worktree" ]; then
+    local br
+    br="$(git -C "$worktree" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    [ -n "$br" ] && branch_proj="$(norm_branch_project "$br")"
+  fi
 
   local proj ids
-  for proj in "$name" "$name_lc" "$name_norm"; do
+  for proj in "$name" "$name_norm" "$branch_proj"; do
     [ -z "$proj" ] && continue
-    docker compose -f "$compose_file" -p "$proj" down --volumes --remove-orphans 2>/dev/null || true
+    # shellcheck disable=SC2086
+    docker compose -f "$compose_file" -p "$proj" down --volumes --remove-orphans $rmi 2>/dev/null || true
   done
 
-  for proj in "$name" "$name_lc" "$name_norm"; do
+  for proj in "$name" "$name_norm" "$branch_proj"; do
     [ -z "$proj" ] && continue
     ids="$(docker ps -aq --filter "label=com.docker.compose.project=$proj" 2>/dev/null | tr '\n' ' ')"
     if [ -n "$ids" ]; then
@@ -653,7 +661,7 @@ action_stop() {
   fi
 
   echo "  Stopping docker for '$session'..."
-  docker_down_for_workspace "$session" "${worktree:-}"
+  docker_down_for_workspace "$session" "${worktree:-}" stop
 
   # Kill any node/bun processes in pane 1 (build pane)
   local build_pid
@@ -711,7 +719,7 @@ action_cleanup() {
   # 1. Docker — compose down with correct file + project (-p), then remove stragglers by label
   echo "  Stopping docker containers..."
   write_cleanup_status "$name" "Stopping docker" "$cleanup_started_at"
-  docker_down_for_workspace "$name" "${worktree:-}"
+  docker_down_for_workspace "$name" "${worktree:-}" purge
 
   # 2. Kill tmux session (stops all pane processes)
   if tmux has-session -t "$name" 2>/dev/null; then
