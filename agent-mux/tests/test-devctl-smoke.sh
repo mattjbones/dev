@@ -6,7 +6,7 @@ source "$DIR/devctl-test-helpers.sh"
 # Sourcing as a library must NOT launch fzf / run the dispatch, and must exit 0.
 # Guard with timeout to prevent hangs if source guard regresses.
 _out_file=$(mktemp)
-trap "rm -f '$_out_file'" RETURN
+trap "rm -f '$_out_file'" EXIT
 
 DEVCTL_LIB=1 bash -c 'source "'"$DIR"'/../dev-ctl.sh"; echo SOURCED_OK' > "$_out_file" 2>&1 &
 _pid=$!
