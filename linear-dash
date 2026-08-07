@@ -39,10 +39,10 @@
 // Details page (↵ from the list): CI outline (failing/running + passing count),
 // unresolved review comments, then Linear comments — all lazily loaded and cached
 // for the session. j/k (Ctrl-d/u, g/G) scroll; r refetches; Esc returns. The header
-// links to Graphite · GitHub · Linear; CI rows link to their GitHub Actions run.
+// links to GitHub · Linear; CI rows link to their GitHub Actions run.
 //
 // Clickable links (OSC 8, in supporting terminals): the ticket id/title → Linear,
-// and the PR #number → Graphite. Set NO_HYPERLINKS=1 to disable.
+// and the PR #number → GitHub. Set NO_HYPERLINKS=1 to disable.
 //
 // Config (no secrets in this file):
 //   LINEAR_API_KEY            Linear personal API key, or put it in
@@ -727,7 +727,6 @@ async function emitBoardJson(branches) {
 }
 
 // ---------- details page data (lazy, on Enter) ----------
-const graphiteUrl = (num) => `https://app.graphite.dev/github/pr/${ARGS.repo}/${num}`;
 const githubPrUrl = (num) => `https://github.com/${ARGS.repo}/pull/${num}`;
 
 // CI checks split into failing / running, with a count of the passing ones.
@@ -848,7 +847,7 @@ function reviewSummary(pr) {
 }
 
 function mergeReadiness(pr, onMain, prNumber = pr?.number) {
-  const num = prNumber != null ? link(graphiteUrl(prNumber), cyan(`#${prNumber}`)) : dim('—');
+  const num = prNumber != null ? link(githubPrUrl(prNumber), cyan(`#${prNumber}`)) : dim('—');
   // `onMain` (PR landed on origin/main) is the authoritative "merged" signal for
   // Graphite-closed PRs, and it holds even when the live `gh pr view` failed and
   // left us without a PR object — so honour it before bailing on a missing pr.
@@ -1191,7 +1190,6 @@ function detailsHeader(meta) {
   const title = bold(`  ${meta.ticketId ?? '(no ticket)'}`) + (meta.prNumber != null ? `  ${cyan(`#${meta.prNumber}`)}` : '') + (meta.title ? dim(`  ${meta.title}`) : '');
   const links = [];
   if (meta.prNumber != null) {
-    links.push(link(graphiteUrl(meta.prNumber), 'Graphite'));
     links.push(link(githubPrUrl(meta.prNumber), 'GitHub'));
   }
   if (meta.linearUrl) {
@@ -1218,7 +1216,7 @@ function detailsBody(meta, parts, cols) {
     }
     let line = `  ${bold('Stack')}  ${bits.join(' · ')}`;
     if (s.blocker) {
-      line += dim('  · blocked by ') + link(graphiteUrl(s.blocker.number), cyan(`#${s.blocker.number}`)) + dim(` ${truncate(s.blocker.title, 50)}`);
+      line += dim('  · blocked by ') + link(githubPrUrl(s.blocker.number), cyan(`#${s.blocker.number}`)) + dim(` ${truncate(s.blocker.title, 50)}`);
     }
     lines.push(line, '');
   }
