@@ -141,12 +141,17 @@ alias gs="git status"
 #alias gtco="git checkout "
 alias gco="git checkout " 
 
-alias gts="gt sync"
-alias gtc="gt create --all -m"
-alias gtp="gt submit -d"
-alias gtps="gt submit -s"
-alias gtu="gt modify --all"
-alias gtco="gt checkout"
+#alias gts="gt sync"
+#alias gtc="gt create --all -m"
+#alias gtp="gt submit -d"
+#alias gtps="gt submit -s"
+#alias gtu="gt modify --all"
+#alias gtco="gt checkout"
+
+alias gts="gh stack sync"
+alias gtc="gh stack add"
+alias gtp="gh stack push"
+alias gtco="gh stack switch"
 
 
 
