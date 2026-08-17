@@ -22,6 +22,18 @@ SCRIPT_DIR="$(cd -P "$(dirname "$_dev_source")" && pwd)"
 unset _dev_source _dev_dir _dev_link
 LUPA_REPO="$HOME/workspace/lupa"
 
+# shellcheck source=dev-close-cleanup.sh
+. "$SCRIPT_DIR/dev-close-cleanup.sh"
+
+# Record uuid -> worktree so the close-watcher can map a closed workspace back
+# to its docker project. Called on both create and reattach (reattach refreshes
+# the uuid after a cmux restart reissues workspace ids).
+dev_record_workspace_map() {
+  [ -n "${CMUX_WORKSPACE_ID:-}" ] || return 0
+  mkdir -p "$DEV_STATE_DIR/workspace-map" 2>/dev/null || true
+  printf '%s' "$WORKTREE" > "$DEV_STATE_DIR/workspace-map/$CMUX_WORKSPACE_ID"
+}
+
 # Set by ensure_monorepo_deps when it starts a background pnpm install, so the
 # build pane can wait for it before launching the dev server. Empty = no wait.
 PNPM_INSTALL_DONE_FILE=""
@@ -293,6 +305,8 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
   # Ensure the shared title daemon is up (no-op if already running) - the setup
   # block below that normally launches it is skipped on the reattach path.
   nohup "$SCRIPT_DIR/dev-tmux-titled.sh" >/dev/null 2>&1 &
+  dev_record_workspace_map
+  dc_reup "$WORKTREE" || true
   exec tmux attach-session -t "$SESSION"
 fi
 
@@ -318,6 +332,7 @@ fi
 # Create session with first pane: agent
 tmux new-session -d -s "$SESSION" -c "$WORKTREE" -n "dev"
 propagate_cmux_env "$SESSION"
+dev_record_workspace_map
 sync_session_state
 
 # Tag sessions inactive in the OneDrive manifest as soon as they close
