@@ -182,6 +182,7 @@ session_info() {
   local cleanup_status=""
 
   [ -z "${DEVCTL_PR_MAP+x}" ] && devctl_build_render_lookups
+  [ -z "${DEVCTL_WORKTREE_MAP+x}" ] && devctl_build_worktree_lookup
 
   cleanup_status="$(format_cleanup_status "$session" || true)"
   if [ -n "$cleanup_status" ]; then
@@ -372,6 +373,25 @@ all_worktree_names() {
 
 find_worktree_path_by_name() {
   local target_name="$1"
+
+  # If the once-per-render lookup has been built (DEVCTL_WORKTREE_MAP is SET,
+  # even if it happens to be empty), consult it instead of re-parsing
+  # `git worktree list --porcelain` and re-forking `basename` per call. Falls
+  # back to the full scan below when the map hasn't been built — e.g.
+  # resolve_workspace_worktree's callers (action_cleanup/action_stop) are
+  # standalone process invocations that never call devctl_build_worktree_lookup.
+  if [ -n "${DEVCTL_WORKTREE_MAP+x}" ]; then
+    local map_name map_path
+    while IFS=$'\t' read -r map_name map_path; do
+      [ -n "$map_name" ] || continue
+      if [ "$map_name" = "$target_name" ]; then
+        printf '%s\n' "$map_path"
+        return 0
+      fi
+    done <<< "$DEVCTL_WORKTREE_MAP"
+    return 1
+  fi
+
   local wt_path=""
 
   while IFS= read -r line; do
@@ -438,6 +458,43 @@ devctl_build_render_lookups() {
     | awk -F'\t' '{m[$1]=$2} END{for(k in m) print k"\t"m[k]}' || true
   )"
   export DEVCTL_MERGED_SET DEVCTL_PR_MAP
+}
+
+# Internal helper for devctl_build_worktree_lookup: emit `name<TAB>path` for
+# every worktree except $LUPA_REPO itself. Kept as its own function (rather
+# than inlined in a `DEVCTL_WORKTREE_MAP="$( ... )"` assignment) because
+# nesting a `case` that reads from a `<(...)` process substitution directly
+# inside a `$(...)` command substitution trips a bash 3.2 parser bug (macOS's
+# default /bin/bash) that leaves `line`/loop vars unbound. One level of
+# indirection — command-substituting a plain function call — sidesteps it,
+# same as the existing all_worktree_names/find_worktree_path_by_name do.
+_devctl_worktree_map_lines() {
+  local wt_path=""
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *)
+        wt_path="${line#worktree }"
+        ;;
+      "")
+        if [ -n "$wt_path" ] && [ "$wt_path" != "$LUPA_REPO" ]; then
+          printf '%s\t%s\n' "$(basename "$wt_path")" "$wt_path"
+        fi
+        wt_path=""
+        ;;
+    esac
+  done < <(git -C "$LUPA_REPO" worktree list --porcelain 2>/dev/null; echo "")
+}
+
+# Build a once-per-render lookup of worktree name -> path, consulted by
+# find_worktree_path_by_name so that listing many tmux sessions doesn't
+# re-parse `git worktree list --porcelain` (and re-fork `basename` per
+# entry) once per session via worktree_path_for_session/session_info.
+# Produces:
+#   DEVCTL_WORKTREE_MAP — newline-separated `name<TAB>path` entries
+#                         (excludes $LUPA_REPO itself, same as find_worktree_path_by_name's scan)
+devctl_build_worktree_lookup() {
+  DEVCTL_WORKTREE_MAP="$(_devctl_worktree_map_lines || true)"
+  export DEVCTL_WORKTREE_MAP
 }
 
 # One-line PR state + whether the branch is merged into main, using the
@@ -519,6 +576,7 @@ format_sessions() {
   fi
   export DEV_CTL_PR_CACHE
   devctl_build_render_lookups
+  devctl_build_worktree_lookup
 
   local orphaned
   orphaned="$(list_orphaned_sessions)"
