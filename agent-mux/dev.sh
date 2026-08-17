@@ -229,10 +229,16 @@ BRANCH="${1:-}"
 if [ -n "$BRANCH" ]; then
   WORKTREE="$HOME/workspace/$BRANCH"
   CLAUDE_WORKTREE="$LUPA_REPO/.claude/worktrees/$BRANCH"
+  # No early `exit` here: awk closing its end of the pipe before git finishes
+  # writing (common with a few hundred worktrees) kills git with SIGPIPE
+  # (exit 141), which `pipefail` surfaces as this bare assignment's exit
+  # status, aborting the whole script under `set -e` with no output. Let awk
+  # drain git's output to EOF instead — cheap for a few hundred lines, and the
+  # branch match is unique so it only ever prints once regardless.
   EXISTING_WORKTREE="$(
     git -C "$LUPA_REPO" worktree list --porcelain 2>/dev/null | awk -v branch="refs/heads/$BRANCH" '
       $1 == "worktree" { wt = $2 }
-      $1 == "branch" && $2 == branch { print wt; exit }
+      $1 == "branch" && $2 == branch { print wt }
     '
   )"
 

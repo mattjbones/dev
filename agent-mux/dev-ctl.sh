@@ -23,6 +23,9 @@ set -euo pipefail
 #                             Add --include-closed to also sweep CLOSED-unmerged PRs.
 #   ./dev-ctl.sh prune-branches     Delete orphaned local branches (merged / remote
 #                             gone; closed-unmerged kept). Add --include-closed too.
+#   ./dev-ctl.sh prune-docker       Preview orphaned docker projects (no matching
+#                             worktree) — dry-run, removes nothing. Add --apply to
+#                             actually remove their containers/volumes/images.
 #   ./dev-ctl.sh verify-main  Unshallow main lupa repo if needed (for worktrees)
 #
 # Keybindings (in fzf):
@@ -45,12 +48,50 @@ while [ -h "$_dctl_source" ]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$_dctl_source")" && pwd)"
 unset _dctl_source _dctl_dir _dctl_link
+
+# Compose project normalisation — MUST mirror docker/docker-start.sh.
+norm_project() { # <name> -> compose project (name stage)
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g'
+}
+norm_branch_project() { # <branch> -> compose project (branch stage then name stage)
+  local b
+  b="$(printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g' | tr '[:upper:]' '[:lower:]' | sed 's/^claude-slack-//' || true)"
+  norm_project "$b"
+}
+
 CONFIG_DIR="$HOME/.config/dev-ctl"
 QUICK_ACTIONS="$CONFIG_DIR/quick-actions.txt"
 DEV_TMUX="$SCRIPT_DIR/dev.sh"
 LUPA_REPO="$HOME/workspace/lupa"
 GITHUB_REPO="${DEV_CTL_GITHUB_REPO:-LupaPets/lupa}"
 CLEANUP_STATE_DIR="/tmp/dev-ctl-cleanup"
+DEVCTL_PR_CACHE_FILE="${DEVCTL_PR_CACHE_FILE:-/tmp/dev-ctl/pr-cache.json}"
+DEVCTL_PR_CACHE_TTL="${DEVCTL_PR_CACHE_TTL:-30}"
+DEVCTL_INFO_CACHE_FILE="${DEVCTL_INFO_CACHE_FILE:-/tmp/dev-ctl/info-cache}"
+DEVCTL_INFO_CACHE_TTL="${DEVCTL_INFO_CACHE_TTL:-3}"
+# TTL for the inactive-worktree branch of preview_pane (see below). The live-tmux
+# branch is not cached at all — it was already fast and the pane content can change
+# every poll, so caching it only added staleness with no measured benefit.
+DEVCTL_PREVIEW_TTL="${DEVCTL_PREVIEW_TTL:-5}"
+
+# Fetch (and TTL-cache to disk) the batched `gh pr list` JSON used by
+# format_sessions. Pass "force" to bypass the cache and rewrite it.
+load_pr_cache() { # [force]
+  local force="${1:-}"
+  mkdir -p "$(dirname "$DEVCTL_PR_CACHE_FILE")" 2>/dev/null || true
+  if [ "$force" != "force" ] && [ -f "$DEVCTL_PR_CACHE_FILE" ]; then
+    local age
+    age=$(( $(date +%s) - $(stat -f %m "$DEVCTL_PR_CACHE_FILE" 2>/dev/null || echo 0) ))
+    if [ "$age" -ge 0 ] && [ "$age" -lt "$DEVCTL_PR_CACHE_TTL" ]; then
+      cat "$DEVCTL_PR_CACHE_FILE"
+      return 0
+    fi
+  fi
+  local json
+  json="$(gh pr list --repo "$GITHUB_REPO" --state all --limit 400 --json headRefName,state,number 2>/dev/null || echo '[]')"
+  printf '%s' "$json" > "$DEVCTL_PR_CACHE_FILE" 2>/dev/null || true
+  printf '%s' "$json"
+}
 
 # ---------------------------------------------------------------------------
 # Colours
@@ -140,6 +181,9 @@ session_info() {
   local session="$1"
   local cleanup_status=""
 
+  [ -z "${DEVCTL_PR_MAP+x}" ] && devctl_build_render_lookups
+  [ -z "${DEVCTL_WORKTREE_MAP+x}" ] && devctl_build_worktree_lookup
+
   cleanup_status="$(format_cleanup_status "$session" || true)"
   if [ -n "$cleanup_status" ]; then
     printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$session" "⌛" " " " " "—" "$cleanup_status"
@@ -149,8 +193,8 @@ session_info() {
   # Docker status
   local docker_icon=""
   local compose_project
-  # Mirror docker-start.sh's compose project normalisation (lowercase, non [a-z0-9_-] -> '-')
-  compose_project="$(printf '%s' "$session" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/--*/-/g')"
+  # Mirror docker-start.sh's compose project normalisation via the shared helper.
+  compose_project="$(norm_project "$session")"
   local worktree="$HOME/workspace/$session"
   if docker ps --filter "label=com.docker.compose.project=$compose_project" --filter "status=running" -q 2>/dev/null | grep -q .; then
     docker_icon="🐳"
@@ -274,10 +318,28 @@ list_deleting_workspaces() {
 }
 
 info_line() {
-  local inactive_count deleting_count non_actionable matched visible_total
-  inactive_count="$(count_inactive_worktrees)"
-  deleting_count="$(count_deleting_workspaces)"
-  non_actionable=$(( inactive_count + deleting_count ))
+  local non_actionable matched visible_total age
+  mkdir -p "$(dirname "$DEVCTL_INFO_CACHE_FILE")" 2>/dev/null || true
+  if [ -f "$DEVCTL_INFO_CACHE_FILE" ]; then
+    age=$(( $(date +%s) - $(stat -f %m "$DEVCTL_INFO_CACHE_FILE" 2>/dev/null || echo 0) ))
+  else
+    age=999999
+  fi
+  if [ -f "$DEVCTL_INFO_CACHE_FILE" ] && [ "$age" -ge 0 ] && [ "$age" -lt "$DEVCTL_INFO_CACHE_TTL" ]; then
+    non_actionable="$(cat "$DEVCTL_INFO_CACHE_FILE" 2>/dev/null || echo 0)"
+  else
+    # count_inactive_worktrees forks basename/grep once per worktree (can be
+    # hundreds on this machine) and is the expensive part of this function —
+    # see profiling numbers in the commit message. fzf calls info_line on
+    # essentially every keystroke, so this is TTL-cached rather than re-run
+    # per keystroke; the worktree/cleanup list rarely changes within a few
+    # seconds, so a short TTL keeps it fresh without the per-keystroke cost.
+    local inactive_count deleting_count
+    inactive_count="$(count_inactive_worktrees)"
+    deleting_count="$(count_deleting_workspaces)"
+    non_actionable=$(( inactive_count + deleting_count ))
+    printf '%s' "$non_actionable" > "$DEVCTL_INFO_CACHE_FILE" 2>/dev/null || true
+  fi
 
   matched="${FZF_MATCH_COUNT:-0}"
   visible_total="${FZF_TOTAL_COUNT:-0}"
@@ -311,6 +373,25 @@ all_worktree_names() {
 
 find_worktree_path_by_name() {
   local target_name="$1"
+
+  # If the once-per-render lookup has been built (DEVCTL_WORKTREE_MAP is SET,
+  # even if it happens to be empty), consult it instead of re-parsing
+  # `git worktree list --porcelain` and re-forking `basename` per call. Falls
+  # back to the full scan below when the map hasn't been built — e.g.
+  # resolve_workspace_worktree's callers (action_cleanup/action_stop) are
+  # standalone process invocations that never call devctl_build_worktree_lookup.
+  if [ -n "${DEVCTL_WORKTREE_MAP+x}" ]; then
+    local map_name map_path
+    while IFS=$'\t' read -r map_name map_path; do
+      [ -n "$map_name" ] || continue
+      if [ "$map_name" = "$target_name" ]; then
+        printf '%s\n' "$map_path"
+        return 0
+      fi
+    done <<< "$DEVCTL_WORKTREE_MAP"
+    return 1
+  fi
+
   local wt_path=""
 
   while IFS= read -r line; do
@@ -359,11 +440,68 @@ worktree_path_for_session() {
   return 1
 }
 
-# One-line PR state + whether the branch is merged into main (git), using batched gh JSON in DEV_CTL_PR_CACHE.
+# Build once-per-render lookups consulted by pr_merge_summary_for_branch, so
+# that listing many sessions doesn't fork `git branch --merged`/`jq` per row.
+# Produces:
+#   DEVCTL_MERGED_SET — newline-separated set of branch names merged into main
+#   DEVCTL_PR_MAP     — lines of `branch<TAB>STATE #num` (highest PR number per branch)
+# Consumes DEV_CTL_PR_CACHE (JSON array) set by format_sessions.
+devctl_build_render_lookups() {
+  DEVCTL_MERGED_SET="$(
+    { git -C "$LUPA_REPO" branch --merged main 2>/dev/null | sed 's/^[*+ ]*//'
+      git -C "$LUPA_REPO" branch -r --merged origin/main 2>/dev/null | sed 's#^[*+ ]*origin/##'
+    } | grep . | sort -u || true
+  )"
+  DEVCTL_PR_MAP="$(
+    printf '%s' "${DEV_CTL_PR_CACHE:-[]}" | jq -r '
+      sort_by(.number) | .[] | "\(.headRefName)\t\(.state) #\(.number)"' 2>/dev/null \
+    | awk -F'\t' '{m[$1]=$2} END{for(k in m) print k"\t"m[k]}' || true
+  )"
+  export DEVCTL_MERGED_SET DEVCTL_PR_MAP
+}
+
+# Internal helper for devctl_build_worktree_lookup: emit `name<TAB>path` for
+# every worktree except $LUPA_REPO itself. Kept as its own function (rather
+# than inlined in a `DEVCTL_WORKTREE_MAP="$( ... )"` assignment) because
+# nesting a `case` that reads from a `<(...)` process substitution directly
+# inside a `$(...)` command substitution trips a bash 3.2 parser bug (macOS's
+# default /bin/bash) that leaves `line`/loop vars unbound. One level of
+# indirection — command-substituting a plain function call — sidesteps it,
+# same as the existing all_worktree_names/find_worktree_path_by_name do.
+_devctl_worktree_map_lines() {
+  local wt_path=""
+  while IFS= read -r line; do
+    case "$line" in
+      worktree\ *)
+        wt_path="${line#worktree }"
+        ;;
+      "")
+        if [ -n "$wt_path" ] && [ "$wt_path" != "$LUPA_REPO" ]; then
+          printf '%s\t%s\n' "$(basename "$wt_path")" "$wt_path"
+        fi
+        wt_path=""
+        ;;
+    esac
+  done < <(git -C "$LUPA_REPO" worktree list --porcelain 2>/dev/null; echo "")
+}
+
+# Build a once-per-render lookup of worktree name -> path, consulted by
+# find_worktree_path_by_name so that listing many tmux sessions doesn't
+# re-parse `git worktree list --porcelain` (and re-fork `basename` per
+# entry) once per session via worktree_path_for_session/session_info.
+# Produces:
+#   DEVCTL_WORKTREE_MAP — newline-separated `name<TAB>path` entries
+#                         (excludes $LUPA_REPO itself, same as find_worktree_path_by_name's scan)
+devctl_build_worktree_lookup() {
+  DEVCTL_WORKTREE_MAP="$(_devctl_worktree_map_lines || true)"
+  export DEVCTL_WORKTREE_MAP
+}
+
+# One-line PR state + whether the branch is merged into main, using the
+# once-per-render lookups DEVCTL_PR_MAP / DEVCTL_MERGED_SET built by
+# devctl_build_render_lookups. Does NOT fork git/jq itself.
 pr_merge_summary_for_branch() {
-  local branch="$1"
-  local cache="${DEV_CTL_PR_CACHE:-[]}"
-  local pr_line merged_local=""
+  local branch="$1" pr_line="" merged_local=""
 
   if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
     printf '%s\n' "—"
@@ -374,18 +512,8 @@ pr_merge_summary_for_branch() {
     return
   fi
 
-  if command -v jq &>/dev/null; then
-    pr_line="$(
-      printf '%s' "$cache" | jq -r --arg b "$branch" '
-        [.[] | select(.headRefName == $b)] | sort_by(.number) | reverse | .[0]
-        | if . == null then empty else "\(.state) #\(.number)" end
-      ' 2>/dev/null || true
-    )"
-  fi
-
-  if git -C "$LUPA_REPO" branch --merged main 2>/dev/null | grep -qw "$branch"; then
-    merged_local=1
-  elif git -C "$LUPA_REPO" branch -r --merged origin/main 2>/dev/null | grep -qw "origin/$branch"; then
+  pr_line="$(printf '%s\n' "${DEVCTL_PR_MAP:-}" | awk -F'\t' -v b="$branch" '$1==b{print $2; exit}')"
+  if printf '%s\n' "${DEVCTL_MERGED_SET:-}" | grep -qxF "$branch"; then
     merged_local=1
   fi
 
@@ -442,13 +570,13 @@ list_orphaned_sessions() {
 # Format session list for fzf display.
 format_sessions() {
   if command -v gh &>/dev/null && command -v jq &>/dev/null; then
-    DEV_CTL_PR_CACHE="$(
-      gh pr list --repo "$GITHUB_REPO" --state all --limit 400 --json headRefName,state,number 2>/dev/null || echo '[]'
-    )"
+    DEV_CTL_PR_CACHE="$(load_pr_cache "${DEVCTL_FORCE_REFRESH:-}")"
   else
     DEV_CTL_PR_CACHE="[]"
   fi
   export DEV_CTL_PR_CACHE
+  devctl_build_render_lookups
+  devctl_build_worktree_lookup
 
   local orphaned
   orphaned="$(list_orphaned_sessions)"
@@ -559,24 +687,34 @@ resolve_workspace_worktree() {
 docker_down_for_workspace() {
   local name="$1"
   local worktree="${2:-}"
+  local mode="${3:-stop}"
   local compose_file="$LUPA_REPO/docker/docker-compose.dev.yml"
 
   if [ -n "$worktree" ] && [ -f "$worktree/docker/docker-compose.dev.yml" ]; then
     compose_file="$worktree/docker/docker-compose.dev.yml"
   fi
 
-  local name_lc name_norm
-  name_lc="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
-  # docker-start.sh normalises further: non [a-z0-9_-] chars become '-'
-  name_norm="$(printf '%s' "$name_lc" | sed 's/[^a-z0-9_-]/-/g; s/--*/-/g')"
+  local rmi=""
+  [ "$mode" = "purge" ] && rmi="--rmi local"
+
+  local name_norm branch_proj=""
+  name_norm="$(norm_project "$name" 2>/dev/null || true)"
+  if [ -n "$worktree" ] && [ -d "$worktree" ]; then
+    local br
+    br="$(git -C "$worktree" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    if [ -n "$br" ]; then
+      branch_proj="$(norm_branch_project "$br" 2>/dev/null || true)"
+    fi
+  fi
 
   local proj ids
-  for proj in "$name" "$name_lc" "$name_norm"; do
+  for proj in "$name" "$name_norm" "$branch_proj"; do
     [ -z "$proj" ] && continue
-    docker compose -f "$compose_file" -p "$proj" down --volumes --remove-orphans 2>/dev/null || true
+    # shellcheck disable=SC2086
+    docker compose -f "$compose_file" -p "$proj" down --volumes --remove-orphans $rmi 2>/dev/null || true
   done
 
-  for proj in "$name" "$name_lc" "$name_norm"; do
+  for proj in "$name" "$name_norm" "$branch_proj"; do
     [ -z "$proj" ] && continue
     ids="$(docker ps -aq --filter "label=com.docker.compose.project=$proj" 2>/dev/null | tr '\n' ' ')"
     if [ -n "$ids" ]; then
@@ -596,6 +734,140 @@ docker_down_for_workspace() {
       fi
     done
   fi
+}
+
+# ---------------------------------------------------------------------------
+# Live-set + orphan-project detection (used by prune-docker reconciliation).
+# Safety direction: when in doubt, KEEP. A too-large live-set only risks
+# leaving an orphan behind; a too-small one risks deleting a live worktree's
+# DB. Never invert this.
+# ---------------------------------------------------------------------------
+
+devctl_live_projects() {
+  git -C "$LUPA_REPO" worktree list --porcelain 2>/dev/null | awk '
+    /^worktree /{ n=split($2,a,"/"); base=a[n]; print base; wt=1 }
+    /^branch /{ sub("refs/heads/","",$2); print "B:" $2 }
+  ' | while IFS= read -r line; do
+    case "$line" in
+      B:*) norm_branch_project "${line#B:}" 2>/dev/null || true ;;
+      *)   base="$line"; printf '%s\n%s\n' "$base" "$(norm_project "$base" 2>/dev/null || true)" ;;
+    esac
+  done | grep . | sort -u || true
+}
+
+devctl_is_infra() { # <project>
+  case "$1" in
+    lupa-proxy|supabase_*|supabase-*|buildx_buildkit_*|buildkit*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+devctl_all_projects() {
+  { docker volume ls -q 2>/dev/null | while IFS= read -r v; do
+      docker volume inspect "$v" --format '{{index .Labels "com.docker.compose.project"}}' 2>/dev/null
+    done
+    docker ps -a --format '{{.Label "com.docker.compose.project"}}' 2>/dev/null
+    # Images: this is the source that reclaims the historical ~111GB backlog.
+    # Worktrees torn down by the OLD (pre-cleanup) teardown ran
+    # `down --volumes` with no `--rmi`, so for those, the volume and
+    # container are long gone and only a tagged compose image remains — with
+    # no volume/container left to discover it via the two sources above.
+    # NB: `docker images --format '{{.Label "..."}}'` errors on this docker
+    # CLI's image formatter context (no `.Label` method for images, unlike
+    # the container/ps context used above) — verified empirically. Use
+    # `image inspect`'s Config.Labels instead, mirroring the volume-inspect
+    # pattern above.
+    docker images --filter "label=com.docker.compose.project" -q 2>/dev/null | sort -u | while IFS= read -r i; do
+      docker image inspect "$i" --format '{{index .Config.Labels "com.docker.compose.project"}}' 2>/dev/null
+    done
+  } | grep -vE '^$|<no value>' | sort -u || true
+}
+
+devctl_orphan_projects() {
+  local live; live="$(devctl_live_projects)"
+  if [ -z "$live" ]; then
+    echo "devctl_orphan_projects: empty live-set (git worktree list failed?) — refusing to compute orphans" >&2
+    return 1
+  fi
+  local p
+  devctl_all_projects | while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    if devctl_is_infra "$p"; then continue; fi
+    if printf '%s\n' "$live" | grep -qxF "$p"; then continue; fi
+    printf '%s\n' "$p"
+  done
+}
+
+# Remove all docker resources for one compose project (by label).
+devctl_purge_project() { # <project>
+  local proj="$1" ids
+  ids="$(docker ps -a -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null | tr '\n' ' ')" || true
+  # shellcheck disable=SC2086
+  [ -n "$ids" ] && docker rm -f $ids 2>/dev/null || true
+  local v
+  for v in $(docker volume ls -q 2>/dev/null || true); do
+    if [ "$(docker volume inspect "$v" --format '{{index .Labels "com.docker.compose.project"}}' 2>/dev/null || true)" = "$proj" ]; then
+      docker volume rm "$v" 2>/dev/null || true
+    fi
+  done
+  local img
+  for img in $(docker images -q --filter "label=com.docker.compose.project=$proj" 2>/dev/null || true); do
+    docker image rm "$img" 2>/dev/null || true
+  done
+}
+
+devctl_removal_after_keepers() { # <candidates-nl> <keepers-nl>
+  local candidates="$1" keepers="${2:-}" p
+  printf '%s\n' "$candidates" | while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    if [ -n "$keepers" ] && printf '%s\n' "$keepers" | grep -qxF "$p"; then continue; fi
+    printf '%s\n' "$p"
+  done
+}
+
+action_prune_docker() { # <dry_run> [keepers-newline]
+  local dry_run="${1:-true}" keepers="${2:-}"
+  local orphans; orphans="$(devctl_orphan_projects)" || true
+  if [ -z "$orphans" ]; then echo "No orphaned docker projects found."; return 0; fi
+  local p
+  echo "Orphaned docker projects (no matching worktree):"
+  printf '%s\n' "$orphans" | while IFS= read -r p; do [ -n "$p" ] && echo "  ○ $p"; done
+  if [ "$dry_run" = "true" ] && [ -t 0 ]; then
+    printf 'Remove these? [y]es / [n]o / [s]elect keepers: '
+    read -r reply
+    case "$reply" in
+      y|Y) dry_run=false; keepers="" ;;
+      s|S)
+        # Capture fzf's real exit code via `|| fzf_rc=$?` rather than a
+        # trailing `|| true` on the assignment: under `set -e` (top of this
+        # script), `keepers="$(... | fzf ...)"` with no guard at all would
+        # abort the *whole script* the instant fzf exits non-zero (e.g. 130
+        # on Esc/Ctrl-C) — the failure trips -e before this line's `$?`
+        # capture would ever run. `|| fzf_rc=$?` keeps the assignment inside
+        # an OR-list (exempt from -e) while still recording fzf's real exit
+        # status (pipefail makes the pipeline's status fzf's own).
+        local fzf_rc=0
+        keepers="$(printf '%s\n' "$orphans" | fzf --multi \
+          --header='TAB = keep (spare from removal); Enter to proceed' \
+          --prompt='keep > ')" || fzf_rc=$?
+        if [ "$fzf_rc" -ne 0 ]; then
+          echo "Aborted."
+          return 0
+        fi
+        dry_run=false ;;
+      *) echo "Aborted."; return 0 ;;
+    esac
+  elif [ "$dry_run" = "true" ]; then
+    echo "(dry-run — re-run with --apply to remove)"
+    return 0
+  fi
+  printf '%s\n' "$orphans" | while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    if [ -n "$keepers" ] && printf '%s\n' "$keepers" | grep -qxF "$p"; then continue; fi
+    echo "  ✕ purging $p"
+    devctl_purge_project "$p"
+  done
+  docker image prune -f >/dev/null 2>&1 || true
 }
 
 action_attach() {
@@ -642,7 +914,7 @@ action_stop() {
   fi
 
   echo "  Stopping docker for '$session'..."
-  docker_down_for_workspace "$session" "${worktree:-}"
+  docker_down_for_workspace "$session" "${worktree:-}" stop
 
   # Kill any node/bun processes in pane 1 (build pane)
   local build_pid
@@ -681,6 +953,18 @@ action_cleanup() {
 
   echo "Cleaning up '$name'..."
 
+  # Resolve the cmux CLI + this session's workspace id BEFORE we kill tmux (step 2).
+  # The pill-owning poller (dev-tmux-title.sh) dies with the session, so its last-set
+  # sidebar pill (📖 storybook / 🐳 docker / context gauge) would otherwise freeze onto
+  # the orphaned row — nothing else ever clears it. The id lives in the tmux session env
+  # and is unrecoverable once the session is gone, so capture it here, clear pills later.
+  local cmux_bin="" cmux_ws_id=""
+  cmux_bin="$(command -v cmux 2>/dev/null || true)"
+  if [ -z "$cmux_bin" ] && [ -x "/Applications/cmux.app/Contents/Resources/bin/cmux" ]; then
+    cmux_bin="/Applications/cmux.app/Contents/Resources/bin/cmux"
+  fi
+  cmux_ws_id="$(tmux show-environment -t "$name" CMUX_WORKSPACE_ID 2>/dev/null | sed -n 's/^CMUX_WORKSPACE_ID=//p' || true)"
+
   # Resolve worktree before docker/tmux so compose -f path and working_dir labels match
   local worktree=""
   worktree="$(resolve_workspace_worktree "$name" 2>/dev/null || true)"
@@ -688,7 +972,7 @@ action_cleanup() {
   # 1. Docker — compose down with correct file + project (-p), then remove stragglers by label
   echo "  Stopping docker containers..."
   write_cleanup_status "$name" "Stopping docker" "$cleanup_started_at"
-  docker_down_for_workspace "$name" "${worktree:-}"
+  docker_down_for_workspace "$name" "${worktree:-}" purge
 
   # 2. Kill tmux session (stops all pane processes)
   if tmux has-session -t "$name" 2>/dev/null; then
@@ -723,9 +1007,20 @@ action_cleanup() {
   write_cleanup_status "$name" "Cleaning logs" "$cleanup_started_at"
   rm -f "$LUPA_REPO/.vite-${name}.log" 2>/dev/null || true
 
-  # 6. Token cache
+  # 6. Title subsystem: token cache + state-sig, and the now-orphaned cmux pills.
   write_cleanup_status "$name" "Cleaning cache" "$cleanup_started_at"
   rm -f "/tmp/dev-tmux-title/${name}-tokens" 2>/dev/null || true
+  rm -f "/tmp/dev-tmux-title/${name}-state-sig" 2>/dev/null || true
+  # Leftover preview_pane cache entry for this session name, so a reused name can't
+  # collide with a deleted worktree's stale preview.
+  rm -f "${DEVCTL_PREVIEW_DIR:-/tmp/dev-ctl/preview}/${name}.preview" 2>/dev/null || true
+  # Clear the pills the (now-dead) poller last set — mirror dev-tmux-title.sh's keys.
+  if [ -n "$cmux_ws_id" ] && [ -n "$cmux_bin" ]; then
+    "$cmux_bin" clear-status build   --workspace "$cmux_ws_id" >/dev/null 2>&1 || true
+    "$cmux_bin" clear-status agent   --workspace "$cmux_ws_id" >/dev/null 2>&1 || true
+    "$cmux_bin" clear-status context --workspace "$cmux_ws_id" >/dev/null 2>&1 || true
+    "$cmux_bin" clear-progress       --workspace "$cmux_ws_id" >/dev/null 2>&1 || true
+  fi
 
   # 7. Prune any dangling worktree references
   write_cleanup_status "$name" "Pruning worktrees" "$cleanup_started_at"
@@ -1240,10 +1535,33 @@ action_verify_main() {
 
 preview_pane() {
   local session="$1"
+
+  # Live tmux session: never cache. This was already ~10ms (no measured benefit
+  # from caching it) and its pane content can change every poll, so caching it
+  # would only add staleness for free.
   if tmux has-session -t "$session" 2>/dev/null; then
     tmux capture-pane -t "$session:.0" -p -S -40 2>/dev/null || echo "(no pane content)"
-  else
-    # Inactive worktree — show git log
+    return
+  fi
+
+  # Inactive worktree — this is the ~30-60ms-per-git-fork branch the cache exists
+  # to speed up. dev-tmux-title.sh's poller (and the state-sig file it writes) dies
+  # with the tmux session, so once a worktree is inactive that sig never changes
+  # again — keying the cache on it would serve the same preview indefinitely, even
+  # after the user commits/edits files outside tmux. Use a short TTL instead so a
+  # cached preview is at most DEVCTL_PREVIEW_TTL seconds stale.
+  local dir="${DEVCTL_PREVIEW_DIR:-/tmp/dev-ctl/preview}"
+  mkdir -p "$dir" 2>/dev/null || true
+  local cache="$dir/${session}.preview"
+  if [ -f "$cache" ]; then
+    local age
+    age=$(( $(date +%s) - $(stat -f %m "$cache" 2>/dev/null || echo 0) ))
+    if [ "$age" -ge 0 ] && [ "$age" -lt "$DEVCTL_PREVIEW_TTL" ]; then
+      cat "$cache"
+      return
+    fi
+  fi
+  {
     local worktree="$HOME/workspace/$session"
     if [ ! -d "$worktree" ]; then
       # Check claude agent worktrees
@@ -1259,7 +1577,7 @@ preview_pane() {
     else
       echo "(worktree not found)"
     fi
-  fi
+  } | tee "$cache" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -1269,6 +1587,10 @@ preview_pane() {
 # Export functions and vars so fzf subshells can access them
 export SCRIPT_DIR CONFIG_DIR QUICK_ACTIONS DEV_TMUX LUPA_REPO
 export CLEANUP_STATE_DIR
+
+if [ "${DEVCTL_LIB:-}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 case "${1:-}" in
   # Internal commands used by fzf bindings
@@ -1416,6 +1738,13 @@ case "${1:-}" in
       action_auto_cleanup false
     fi
     ;;
+  prune-docker)
+    if [ "${2:-}" = "--apply" ]; then
+      action_prune_docker false
+    else
+      action_prune_docker true
+    fi
+    ;;
   auto-cleanup-dry)
     if [ "${2:-}" = "--include-closed" ]; then
       action_auto_cleanup true true
@@ -1466,7 +1795,7 @@ case "${1:-}" in
       --bind="ctrl-k:execute($SELF __reap_sessions)+reload($SELF __list)" \
       --bind="ctrl-g:execute($SELF __auto_cleanup)+reload($SELF __list)" \
       --bind="ctrl-b:execute($SELF __prune_branches)+reload($SELF __list)" \
-      --bind="ctrl-r:reload($SELF __list)" \
+      --bind="ctrl-r:reload(DEVCTL_FORCE_REFRESH=force $SELF __list)" \
     || true)"
 
     # Act on selection after fzf has exited and tty is free
