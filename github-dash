@@ -1,0 +1,1010 @@
+#!/usr/bin/env node
+// github-dash — GitHub PR review-queue dashboard, sibling to linear-dash. Where
+// linear-dash starts from Linear tickets and cross-checks GitHub for merge
+// readiness, github-dash starts from GitHub PRs across the whole org and
+// cross-checks Linear for ticket context.
+//
+// Usage:
+//   github-dash [--org name] [--watch [secs]] [--watch-authors logins] [--json] [--all]
+//
+//   --org             GitHub org to search (default: $GITHUB_DASH_ORG or LupaPets).
+//   --watch           self-refreshing interactive TUI (default 60s), same engine
+//                      as linear-dash --watch.
+//   --watch-authors   comma-separated GitHub logins for the "FROM WATCHED
+//                      AUTHORS" section, overriding $GITHUB_DASH_WATCH for this
+//                      run (default: hknakn,dec1024).
+//   --json            machine-readable snapshot of the computed sections, no ANSI
+//                      — always full, never capped by --all/10-row cap below.
+//   --all,-a          show every row per section instead of the default top-10
+//                      cap (in --watch, m toggles this live).
+//
+// Sections (fixed order, each PR appears in exactly one — see the design doc for
+// the full rationale). Each caps at 10 rows by default (some sections run into
+// the hundreds on a repo with broad auto-assigned reviewers) — --all/m shows more:
+//   APPROVED                    — PRs you've reviewed; your latest review is APPROVED
+//   CHANGES REQUESTED/COMMENTED — PRs you've reviewed; latest review is CHANGES_REQUESTED/COMMENTED
+//   OPEN — NO REVIEW            — you're a requested reviewer, haven't reviewed, not via CODEOWNERS
+//   CODEOWNER                   — same as above but the request came in via CODEOWNERS
+//   FROM WATCHED AUTHORS        — open PRs from the watch-list, minus anything already above
+//   MY OPEN PRS / MY DRAFTS     — your own open PRs, split by draft state
+//
+// Interactive --watch keys (TTY only): same engine as linear-dash —
+//   j/k move · h/l section · Ctrl-d/u half-page · g/G ends · / search · n/N next
+//   match · ↵ details · m show all · r refresh · q quit
+//
+// Details page (↵ from the list): CI outline (failing/running + passing count)
+// and unresolved review threads, lazily loaded and cached for the session.
+//
+// Config:
+//   GITHUB_DASH_ORG    default org to search (default: LupaPets)
+//   GITHUB_DASH_WATCH  comma-separated GitHub logins for the watched-authors
+//                      section (default: hknakn,dec1024 — Hakan Akın, presumed Declan)
+//   LINEAR_API_KEY / ~/.config/linear/api_key — for the Linear ticket cross-reference
+//
+// Known simplification: a PR is bucketed CODEOWNER if ANY of its review requests
+// carries asCodeOwner: true, without independently confirming that's the specific
+// request covering you (which would require resolving team membership). In
+// practice a PR you're requested on essentially never carries both an explicit
+// human ask and an unrelated codeowner request at once, so this holds up.
+
+import { execFile } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
+import {
+  bold,
+  computeSearchMatches,
+  cyan,
+  cycleMatch,
+  dim,
+  enterAltScreen,
+  green,
+  halfPage,
+  jumpSection,
+  jumpToMatch,
+  leaveAltScreen,
+  link,
+  magenta,
+  padEnd,
+  red,
+  relTime,
+  scrollView,
+  stripAnsi,
+  truncate,
+  viewport,
+  wrapText,
+  writeFrame,
+  yellow,
+} from './lib/dash-tui.mjs';
+
+const execFileP = promisify(execFile);
+
+const DEFAULT_ORG = 'LupaPets';
+const DEFAULT_REPO = 'LupaPets/lupa'; // cosmetic only — hides the repo column when everything's here
+const DEFAULT_WATCH_LOGINS = ['hknakn', 'dec1024'];
+
+// ---------- args ----------
+function parseArgs(argv) {
+  const args = { org: null, watch: null, watchAuthors: null, json: false, all: false };
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--org') {
+      args.org = argv[++i];
+    } else if (a === '--watch') {
+      const next = Number(argv[i + 1]);
+      args.watch = Number.isFinite(next) && next > 0 ? Number(argv[++i]) : 60;
+    } else if (a === '--watch-authors') {
+      args.watchAuthors = (argv[++i] || '').split(',').map((s) => s.trim()).filter(Boolean);
+    } else if (a === '--json') {
+      args.json = true;
+    } else if (a === '--all' || a === '-a') {
+      args.all = true;
+    } else if (a === '--help' || a === '-h') {
+      console.log('Usage: github-dash [--org name] [--watch [secs]] [--watch-authors logins] [--json] [--all]');
+      console.log('  --org             GitHub org to search (default: LupaPets)');
+      console.log('  --watch           interactive self-refreshing TUI (default 60s)');
+      console.log('  --watch-authors   comma-separated GitHub logins for the watched-authors section');
+      console.log('  --json            machine-readable snapshot, no ANSI (always full, never capped)');
+      console.log('  --all,-a          show every row per section (default: capped at 10, in --watch m toggles)');
+      console.log('');
+      console.log('  --watch keys: j/k move · h/l section · Ctrl-d/u half-page · g/G ends');
+      console.log('                / search · n/N next match · ↵ details · m show all · r refresh · q quit');
+      process.exit(0);
+    } else {
+      console.error(`Unknown argument: ${a}`);
+      process.exit(1);
+    }
+  }
+  return args;
+}
+const ARGS = parseArgs(process.argv);
+const ORG = ARGS.org ?? process.env.GITHUB_DASH_ORG ?? DEFAULT_ORG;
+const watchLogins = () => ARGS.watchAuthors ?? (process.env.GITHUB_DASH_WATCH?.split(',').map((s) => s.trim()).filter(Boolean)) ?? DEFAULT_WATCH_LOGINS;
+
+// Each section caps at this many rows by default — sections like OPEN — NO
+// REVIEW can run into the hundreds on a repo with broad auto-assigned
+// reviewers, and a wall of rows defeats the point of a dashboard. --all (or
+// 'm' live in --watch) shows everything.
+const SECTION_CAP = 10;
+let showAll = ARGS.all;
+
+// ---------- Linear (ticket cross-reference — same approach as linear-dash) ----------
+function linearKey() {
+  if (process.env.LINEAR_API_KEY) {
+    return process.env.LINEAR_API_KEY.trim();
+  }
+  try {
+    return readFileSync(join(homedir(), '.config', 'linear', 'api_key'), 'utf8').trim();
+  } catch {
+    return null;
+  }
+}
+
+async function linearGql(query, variables) {
+  const key = linearKey();
+  if (!key) {
+    throw new Error('no API key');
+  }
+  const res = await fetch('https://api.linear.app/graphql', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: key },
+    body: JSON.stringify({ query, variables }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  const body = await res.json();
+  if (body.errors) {
+    throw new Error(body.errors.map((e) => e.message).join('; '));
+  }
+  return body.data;
+}
+
+// Ticket reference from PR title (ENG-1234 / [QA-336]) or branch (matt/eng-1234-...).
+function ticketIdFromPr(title, headRefName) {
+  const fromTitle = title.match(/\b([A-Z]{2,7}-\d{2,6})\b/);
+  if (fromTitle) {
+    return fromTitle[1];
+  }
+  if (headRefName) {
+    const fromBranch = headRefName.toLowerCase().match(/([a-z]{2,7})-(\d{2,6})/);
+    if (fromBranch) {
+      return `${fromBranch[1].toUpperCase()}-${fromBranch[2]}`;
+    }
+  }
+  return null;
+}
+
+// Best-effort Linear lookup (status/priority) for ticket ids parsed off PRs.
+async function fetchLinearIssuesByIds(ids) {
+  const byId = new Map();
+  if (ids.length === 0) {
+    return byId;
+  }
+  try {
+    const teams = [...new Set(ids.map((id) => id.split('-')[0]))];
+    const numbers = [...new Set(ids.map((id) => Number(id.split('-')[1])))];
+    const query = `
+      query($teams: [String!], $numbers: [Float!]) {
+        issues(first: 250, filter: { team: { key: { in: $teams } }, number: { in: $numbers } }) {
+          nodes { identifier url priority state { name type } }
+        }
+      }`;
+    const data = await linearGql(query, { teams, numbers });
+    for (const issue of data.issues.nodes) {
+      byId.set(issue.identifier, issue);
+    }
+  } catch {
+    // enrichment only — sections still render without Linear
+  }
+  return byId;
+}
+
+// ---------- GitHub search ----------
+const SEARCH_FIELDS = 'number,title,url,repository,isDraft,updatedAt,author';
+
+async function searchPrs(extraArgs) {
+  try {
+    const { stdout } = await execFileP('gh', [
+      'search',
+      'prs',
+      '--owner',
+      ORG,
+      '--state',
+      'open',
+      '--limit',
+      '300',
+      '--json',
+      SEARCH_FIELDS,
+      ...extraArgs,
+    ]);
+    return JSON.parse(stdout);
+  } catch {
+    return [];
+  }
+}
+
+const prKey = (pr) => `${pr.repository.nameWithOwner}#${pr.number}`;
+
+let cachedViewerLogin = null;
+async function fetchViewerLogin() {
+  if (cachedViewerLogin) {
+    return cachedViewerLogin;
+  }
+  const { stdout } = await execFileP('gh', ['api', 'user', '-q', '.login']);
+  cachedViewerLogin = stdout.trim();
+  return cachedViewerLogin;
+}
+
+const CI_PASS = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
+const CI_FAIL = new Set(['FAILURE', 'ERROR', 'TIMED_OUT', 'CANCELLED', 'ACTION_REQUIRED', 'STARTUP_FAILURE']);
+
+// One batched GraphQL query per repo, covering everything every row needs:
+// headRefName (Linear ticket fallback), reviews + reviewRequests (bucketing),
+// and aggregated CI counts (rendering) — aliasing every PR number in that repo
+// so this is one round-trip regardless of how many PRs are in play.
+async function fetchEnrichment(prsByRepo) {
+  const result = new Map();
+  for (const [repoFull, numbers] of prsByRepo) {
+    if (numbers.size === 0) {
+      continue;
+    }
+    const [owner, name] = repoFull.split('/');
+    const aliases = [...numbers]
+      .map(
+        (n) => `p${n}: pullRequest(number: ${n}) {
+      headRefName
+      reviews(last: 30) { nodes { author { login } state submittedAt } }
+      reviewRequests(first: 15) { nodes { asCodeOwner } }
+      commits(last: 1) { nodes { commit { statusCheckRollup {
+        contexts(first: 1) {
+          checkRunCountsByState { state count }
+          statusContextCountsByState { state count }
+        }
+      } } } }
+    }`,
+      )
+      .join('\n');
+    const query = `query { repository(owner: "${owner}", name: "${name}") { ${aliases} } }`;
+    try {
+      const { stdout } = await execFileP('gh', ['api', 'graphql', '-f', `query=${query}`], { maxBuffer: 16 * 1024 * 1024 });
+      const repo = JSON.parse(stdout).data.repository;
+      for (const n of numbers) {
+        result.set(`${repoFull}#${n}`, repo[`p${n}`] ?? null);
+      }
+    } catch (err) {
+      // Best-effort: affected rows render without CI/review/codeowner data rather
+      // than failing the whole dashboard — but silent enrichment loss is confusing
+      // (rows quietly missing CI and codeowner flags with no indication why), so
+      // surface it rather than swallowing it entirely.
+      const stderr = String(err?.stderr ?? err.message ?? '').trim().split('\n')[0];
+      process.stderr.write(`github-dash: enrichment failed for ${repoFull} (${numbers.size} PRs): ${stderr}\n`);
+    }
+  }
+  return result;
+}
+
+function ciCountsFromContexts(contexts) {
+  if (!contexts) {
+    return null;
+  }
+  const counts = { pass: 0, fail: 0, pending: 0 };
+  for (const { state, count } of [...contexts.checkRunCountsByState, ...contexts.statusContextCountsByState]) {
+    counts[CI_PASS.has(state) ? 'pass' : CI_FAIL.has(state) ? 'fail' : 'pending'] += count;
+  }
+  return counts;
+}
+
+function ciSummary(counts) {
+  if (!counts || counts.pass + counts.fail + counts.pending === 0) {
+    return { label: dim('no checks'), ok: true };
+  }
+  if (counts.fail > 0) {
+    return { label: red(`✗ CI ${counts.fail} failing`), ok: false };
+  }
+  if (counts.pending > 0) {
+    return { label: yellow(`● CI ${counts.pending} running`), ok: false };
+  }
+  return { label: green(`✓ CI ${counts.pass}`), ok: true };
+}
+
+// Latest review authored by the viewer (reviews arrive oldest-first).
+function latestOwnReview(reviews, viewerLogin) {
+  let latest = null;
+  for (const r of reviews ?? []) {
+    if (r.author?.login !== viewerLogin) {
+      continue;
+    }
+    if (!latest || Date.parse(r.submittedAt) > Date.parse(latest.submittedAt)) {
+      latest = r;
+    }
+  }
+  return latest;
+}
+
+// ---------- details page data (lazy, on Enter) ----------
+const githubPrUrl = (repoFull, num) => `https://github.com/${repoFull}/pull/${num}`;
+
+async function fetchPrCi(repoFull, num) {
+  const { stdout } = await execFileP('gh', ['pr', 'view', String(num), '--repo', repoFull, '--json', 'statusCheckRollup'], {
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  const rollup = JSON.parse(stdout).statusCheckRollup || [];
+  const failing = [];
+  const pending = [];
+  let pass = 0;
+  for (const ch of rollup) {
+    const check = { name: ch.name || ch.context || 'check', url: ch.detailsUrl || ch.targetUrl || null };
+    const running = ch.status && ch.status !== 'COMPLETED';
+    const result = ch.conclusion || ch.state || '';
+    if (running) {
+      pending.push(check);
+    } else if (CI_PASS.has(result)) {
+      pass++;
+    } else if (CI_FAIL.has(result)) {
+      failing.push(check);
+    } else {
+      pending.push(check);
+    }
+  }
+  return { failing, pending, pass };
+}
+
+async function fetchReviewThreads(repoFull, num) {
+  const [owner, name] = repoFull.split('/');
+  const query = `query($owner: String!, $name: String!) {
+    repository(owner: $owner, name: $name) {
+      pullRequest(number: ${num}) {
+        reviewDecision
+        reviewThreads(first: 100) {
+          nodes {
+            isResolved
+            path
+            line
+            originalLine
+            comments(first: 10) { nodes { author { login } body diffHunk } }
+          }
+        }
+      }
+    }
+  }`;
+  const { stdout } = await execFileP('gh', ['api', 'graphql', '-f', `owner=${owner}`, '-f', `name=${name}`, '-f', `query=${query}`], {
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  const pr = JSON.parse(stdout).data.repository.pullRequest;
+  return { decision: pr.reviewDecision, threads: pr.reviewThreads.nodes.filter((t) => !t.isResolved) };
+}
+
+async function fetchDetails(meta) {
+  const [ci, review] = await Promise.allSettled([fetchPrCi(meta.repo, meta.number), fetchReviewThreads(meta.repo, meta.number)]);
+  return { ci, review };
+}
+
+// ---------- compute ----------
+function toRow(pr, enrich, ticketId, linearById, extra) {
+  const linear = ticketId != null ? linearById.get(ticketId) : undefined;
+  return {
+    repo: pr.repository.nameWithOwner,
+    number: pr.number,
+    title: pr.title,
+    prUrl: pr.url,
+    author: pr.author?.login ?? null,
+    ticketId,
+    ticketUrl: linear?.url ?? null,
+    linearStatus: linear?.state?.name ?? null,
+    ci: ciCountsFromContexts(enrich?.commits?.nodes[0]?.commit.statusCheckRollup?.contexts),
+    ageIso: extra?.ageIso ?? pr.updatedAt,
+    ageLabel: extra?.ageLabel ?? 'updated',
+  };
+}
+
+async function compute() {
+  const org = ORG;
+  const logins = watchLogins();
+  const [viewerLogin, reviewRequested, reviewedByMe, myPrs, ...watchedLists] = await Promise.all([
+    fetchViewerLogin(),
+    searchPrs(['--review-requested', '@me']),
+    searchPrs(['--reviewed-by', '@me']),
+    searchPrs(['--author', '@me']),
+    ...logins.map((login) => searchPrs(['--author', login])),
+  ]);
+
+  const allPrs = new Map();
+  const addAll = (list) => {
+    for (const pr of list) {
+      const key = prKey(pr);
+      if (!allPrs.has(key)) {
+        allPrs.set(key, pr);
+      }
+    }
+  };
+  addAll(reviewRequested);
+  addAll(reviewedByMe);
+  addAll(myPrs);
+  for (const list of watchedLists) {
+    addAll(list);
+  }
+
+  const prsByRepo = new Map();
+  for (const pr of allPrs.values()) {
+    const repoFull = pr.repository.nameWithOwner;
+    if (!prsByRepo.has(repoFull)) {
+      prsByRepo.set(repoFull, new Set());
+    }
+    prsByRepo.get(repoFull).add(pr.number);
+  }
+  const enrichment = await fetchEnrichment(prsByRepo);
+
+  // Resolve Linear ticket ids for everything before building rows, so every
+  // section can show ticket status without a second enrichment pass.
+  const ticketIds = new Map(); // prKey -> ticketId|null
+  for (const [key, pr] of allPrs) {
+    const enrich = enrichment.get(key);
+    ticketIds.set(key, ticketIdFromPr(pr.title, enrich?.headRefName ?? null));
+  }
+  const linearById = await fetchLinearIssuesByIds([...new Set([...ticketIds.values()].filter(Boolean))]);
+
+  const buildRow = (pr, extra) => {
+    const key = prKey(pr);
+    return toRow(pr, enrichment.get(key), ticketIds.get(key), linearById, extra);
+  };
+
+  const reviewQueueKeys = new Set([...reviewRequested.map(prKey), ...reviewedByMe.map(prKey)]);
+  const buckets = { approved: [], changesOrComments: [], openNoReview: [], codeowner: [] };
+  const bucketedKeys = new Set();
+  for (const key of reviewQueueKeys) {
+    const pr = allPrs.get(key);
+    const enrich = enrichment.get(key);
+    const myReview = latestOwnReview(enrich?.reviews?.nodes, viewerLogin);
+    const isCodeowner = (enrich?.reviewRequests?.nodes ?? []).some((n) => n.asCodeOwner);
+    const row = buildRow(pr, myReview ? { ageIso: myReview.submittedAt, ageLabel: 'reviewed' } : undefined);
+    bucketedKeys.add(key);
+    if (myReview?.state === 'APPROVED') {
+      buckets.approved.push(row);
+    } else if (myReview?.state === 'CHANGES_REQUESTED' || myReview?.state === 'COMMENTED') {
+      buckets.changesOrComments.push(row);
+    } else if (isCodeowner) {
+      buckets.codeowner.push(row);
+    } else {
+      buckets.openNoReview.push(row);
+    }
+  }
+
+  const watchedByKey = new Map();
+  for (const list of watchedLists) {
+    for (const pr of list) {
+      watchedByKey.set(prKey(pr), pr);
+    }
+  }
+  const watchedEntries = [...watchedByKey.entries()].filter(([key]) => !bucketedKeys.has(key));
+  const watched = watchedEntries.map(([, pr]) => buildRow(pr));
+
+  // "Mine" is last priority: GitHub lets you leave a review (e.g. a self-comment)
+  // on your own PR, so a PR can legitimately land in reviewQueueKeys AND be
+  // yours. usedKeys carries every key already placed in an earlier section so
+  // it never shows twice.
+  const usedKeys = new Set(bucketedKeys);
+  for (const [key] of watchedEntries) {
+    usedKeys.add(key);
+  }
+  const mineOpen = myPrs.filter((pr) => !pr.isDraft && !usedKeys.has(prKey(pr))).map((pr) => buildRow(pr));
+  const mineDrafts = myPrs.filter((pr) => pr.isDraft && !usedKeys.has(prKey(pr))).map((pr) => buildRow(pr));
+
+  const byAge = (a, b) => Date.parse(b.ageIso) - Date.parse(a.ageIso);
+  for (const list of [buckets.approved, buckets.changesOrComments, buckets.openNoReview, buckets.codeowner, watched, mineOpen, mineDrafts]) {
+    list.sort(byAge);
+  }
+
+  const anyNonDefaultRepo = [...allPrs.values()].some((pr) => pr.repository.nameWithOwner !== DEFAULT_REPO);
+  const now = new Date().toLocaleTimeString('en-GB');
+  return {
+    org,
+    viewerLogin,
+    watchLogins: logins,
+    anyNonDefaultRepo,
+    sections: [
+      ['APPROVED', buckets.approved, green],
+      ['CHANGES REQUESTED / COMMENTED', buckets.changesOrComments, yellow],
+      ['OPEN — NO REVIEW', buckets.openNoReview, cyan],
+      ['CODEOWNER', buckets.codeowner, magenta],
+      [`FROM ${logins.join('/').toUpperCase()}`, watched, dim],
+      ['MY OPEN PRS', mineOpen, green],
+      ['MY DRAFTS', mineDrafts, dim],
+    ],
+    now,
+  };
+}
+
+// ---------- render ----------
+function renderRow(row, titleWidth, showRepo) {
+  const cols = [];
+  cols.push(padEnd(link(row.prUrl, cyan(`#${row.number}`)), 8));
+  cols.push(padEnd(magenta(truncate(row.author ?? '—', 17)), 18));
+  if (showRepo) {
+    cols.push(padEnd(dim(row.repo === DEFAULT_REPO ? '—' : row.repo.split('/')[1]), 10));
+  }
+  cols.push(padEnd(link(row.prUrl, truncate(row.title, titleWidth)), titleWidth + 1));
+  cols.push(padEnd(row.ticketId ? link(row.ticketUrl, cyan(row.ticketId)) : dim('—'), 9));
+  cols.push(padEnd(dim(row.linearStatus ?? '—'), 12));
+  cols.push(padEnd(ciSummary(row.ci).label, 16));
+  cols.push(dim(`${row.ageLabel} ${relTime(row.ageIso)}`));
+  return `    ${cols.join(' ')}`;
+}
+
+function render(data) {
+  const width = Math.min(process.stdout.columns || Number(process.env.COLUMNS) || 130, 160);
+  const items = [];
+  const needYou = data.sections[0][1].length + data.sections[1][1].length + data.sections[2][1].length + data.sections[3][1].length;
+  items.push({
+    kind: 'fixed',
+    text: bold(`  github-dash`) + dim(`  ·  ${data.org}  ·  ${needYou} need you  ·  refreshed ${data.now}  ·  `) + green('GitHub ● live'),
+  });
+  items.push({ kind: 'fixed', text: dim('  ' + '─'.repeat(width - 4)) });
+
+  const titleWidth = Math.max(30, width - (data.anyNonDefaultRepo ? 107 : 97));
+
+  // Rows + cap/show-more note for one group, WITHOUT pushing its own header —
+  // the caller has already pushed the 'section' item `sectionText` matches,
+  // whether that's a top-level section or a nested Mine/Others sub-group.
+  const addRows = (sectionText, list) => {
+    if (list.length === 0) {
+      items.push({ kind: 'note', text: dim('    (none)') });
+      return;
+    }
+    const visible = showAll ? list : list.slice(0, SECTION_CAP);
+    for (const row of visible) {
+      items.push({
+        kind: 'row',
+        text: renderRow(row, titleWidth, data.anyNonDefaultRepo),
+        section: sectionText,
+        meta: { repo: row.repo, number: row.number, title: row.title, prUrl: row.prUrl, ticketId: row.ticketId, ticketUrl: row.ticketUrl },
+      });
+    }
+    const hidden = list.length - visible.length;
+    if (hidden > 0) {
+      items.push({ kind: 'note', text: dim(`    ▸ ${hidden} more · ${ARGS.watch != null ? 'press m to show all' : 'run with --all to show all'}`) });
+    }
+  };
+
+  const addSection = (headerText, list, color) => {
+    items.push({ kind: 'blank', text: '' });
+    const sectionText = `  ${color(bold(`${headerText} (${list.length})`))}`;
+    items.push({ kind: 'section', text: sectionText });
+
+    // Split into Mine/Others only when both are actually present — e.g.
+    // CHANGES REQUESTED/COMMENTED regularly mixes in PRs you self-commented
+    // on, which otherwise drown out the "someone else wants changes" signal.
+    // A section that's all-one or all-other renders flat, same as before.
+    const mine = list.filter((row) => row.author === data.viewerLogin);
+    const others = list.filter((row) => row.author !== data.viewerLogin);
+    if (mine.length > 0 && others.length > 0) {
+      const mineHeader = `    ${dim(bold('Mine'))} ${dim(`(${mine.length})`)}`;
+      const othersHeader = `    ${dim(bold('Others'))} ${dim(`(${others.length})`)}`;
+      items.push({ kind: 'section', text: mineHeader });
+      addRows(mineHeader, mine);
+      items.push({ kind: 'blank', text: '' });
+      items.push({ kind: 'section', text: othersHeader });
+      addRows(othersHeader, others);
+    } else {
+      addRows(sectionText, list);
+    }
+  };
+  for (const [title, list, color] of data.sections) {
+    addSection(title, list, color);
+  }
+  items.push({ kind: 'blank', text: '' });
+  return items;
+}
+
+function detailsHeader(meta) {
+  const title = bold(`  #${meta.number}`) + dim(`  ${meta.title}`);
+  const links = [link(meta.prUrl, 'GitHub')];
+  if (meta.ticketUrl) {
+    links.push(link(meta.ticketUrl, 'Linear'));
+  }
+  return [title, dim(`  ${meta.repo}  ·  ${links.join('  ·  ')}`), dim('  ' + '─'.repeat(60))];
+}
+
+function detailsBody(meta, parts, cols) {
+  const lines = [];
+  const wrap = (text, indent) => wrapText(text, Math.max(20, cols - indent - 2)).map((l) => ' '.repeat(indent) + l);
+
+  const ci = parts.ci;
+  if (ci.status === 'rejected') {
+    lines.push(dim('  CI  (couldn’t load)'));
+  } else {
+    const { failing, pending, pass } = ci.value;
+    const bits = [];
+    if (failing.length) {
+      bits.push(red(`✗ ${failing.length}`));
+    }
+    if (pending.length) {
+      bits.push(yellow(`● ${pending.length}`));
+    }
+    bits.push(green(`${pass} ✓`));
+    lines.push(bold('  CI') + dim(`  (${bits.join(' · ')})`));
+    for (const ch of failing) {
+      lines.push(`    ${red('✗')} ${link(ch.url, ch.name)}`);
+    }
+    for (const ch of pending) {
+      lines.push(`    ${yellow('●')} ${link(ch.url, dim(`${ch.name} (running)`))}`);
+    }
+    if (!failing.length && !pending.length) {
+      lines.push(`    ${green(`✓ all ${pass} checks passing`)}`);
+    }
+  }
+  lines.push('');
+
+  const review = parts.review;
+  if (review.status === 'rejected') {
+    lines.push(dim('  Review  (couldn’t load)'));
+  } else {
+    const { decision, threads } = review.value;
+    const badge =
+      decision === 'APPROVED' ? green('✓ approved') : decision === 'CHANGES_REQUESTED' ? red('✗ changes requested') : decision ? yellow('○ review pending') : dim('no review');
+    lines.push(bold('  Review') + dim('  · ') + badge);
+    if (!threads.length) {
+      lines.push(dim('    no unresolved comments'));
+    }
+    for (const t of threads) {
+      lines.push(`    ${cyan(`${t.path}:${t.line ?? t.originalLine ?? '?'}`)}`);
+      const hunk = t.comments.nodes[0]?.diffHunk;
+      if (hunk) {
+        const codeLine = hunk.split('\n').filter(Boolean).pop() || '';
+        lines.push(dim(`      │ ${codeLine.replace(/^[+\- ]/, '').slice(0, Math.max(10, cols - 10))}`));
+      }
+      for (const c of t.comments.nodes) {
+        lines.push(`      ${green(c.author?.login ?? '?')}:`);
+        lines.push(...wrap(c.body, 8));
+      }
+    }
+  }
+
+  while (lines.length && lines[lines.length - 1] === '') {
+    lines.pop();
+  }
+  return lines;
+}
+
+// ---------- JSON output ----------
+function toJson(data) {
+  const rowJson = (r) => ({
+    repo: r.repo,
+    number: r.number,
+    title: r.title,
+    url: r.prUrl,
+    author: r.author,
+    ticketId: r.ticketId,
+    ticketUrl: r.ticketUrl,
+    linearStatus: r.linearStatus,
+    ci: r.ci,
+    ageIso: r.ageIso,
+    ageLabel: r.ageLabel,
+  });
+  return {
+    org: data.org,
+    viewerLogin: data.viewerLogin,
+    watchLogins: data.watchLogins,
+    generatedAt: new Date().toISOString(),
+    sections: data.sections.map(([title, list]) => ({ title, count: list.length, prs: list.map(rowJson) })),
+  };
+}
+
+// ---------- Main ----------
+const flatten = (items) => items.map((i) => i.text).join('\n');
+
+if (ARGS.json) {
+  compute()
+    .then((data) => {
+      console.log(JSON.stringify(toJson(data)));
+    })
+    .catch((err) => {
+      console.error(`Error: ${err.message}`);
+      process.exit(1);
+    });
+} else if (ARGS.watch != null) {
+  const interval = Math.max(10, ARGS.watch) * 1000;
+  const interactive = Boolean(process.stdout.isTTY) && Boolean(process.stdin.isTTY);
+  let left = false;
+  const restore = () => {
+    if (left) {
+      return;
+    }
+    left = true;
+    try {
+      if (interactive) {
+        process.stdin.setRawMode(false);
+      }
+    } catch {
+      // best effort
+    }
+    leaveAltScreen();
+  };
+  process.on('exit', restore);
+  for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, () => {
+      restore();
+      process.exit(0);
+    });
+  }
+  enterAltScreen();
+
+  let last = null;
+  let lastItems = [];
+  let view = 'list'; // 'list' | 'details'
+  const nav = { sel: 0, top: 0 };
+  const details = { key: null, meta: null, loading: false, parts: null, scroll: 0, maxScroll: 0 };
+  const detailsCache = new Map();
+  const search = { active: false, query: '', matches: [], origSel: 0 };
+  let refreshing = false;
+  let manualRefresh = false;
+  const listHint = '  j/k · / search · ↵ details · m show all · r refresh · q quit';
+  const detailsHint = '  j/k scroll · g/G ends · r refresh · esc back · q quit';
+
+  const paintScreen = () => {
+    if (view === 'details') {
+      const body = details.loading ? ['', '  Loading…'] : detailsBody(details.meta, details.parts, process.stdout.columns);
+      const r = scrollView(details.header, body, details.scroll, process.stdout.rows, process.stdout.columns, detailsHint);
+      details.maxScroll = r.maxScroll;
+      writeFrame(r.frame);
+      return;
+    }
+    if (!last) {
+      writeFrame('\n  Loading…');
+      return;
+    }
+    if (!interactive) {
+      writeFrame(flatten(render(last)));
+      return;
+    }
+    lastItems = render(last);
+    let hint = listHint;
+    if (search.active) {
+      const info = !search.query ? '' : search.matches.length ? `  (${search.matches.indexOf(nav.sel) + 1}/${search.matches.length})` : '  (no matches)';
+      hint = `  /${search.query}▌${info}`;
+    } else if (search.matches.length) {
+      hint = `  /${search.query} · ${search.matches.length} matches · n/N next · esc clear · ↵ details · q quit`;
+    }
+    if (manualRefresh) {
+      hint += '  · ⟳ refreshing…';
+    }
+    writeFrame(viewport(lastItems, nav, process.stdout.rows, process.stdout.columns, hint));
+  };
+  const repaint = paintScreen;
+
+  let timer = null;
+  const tick = async () => {
+    if (refreshing) {
+      return;
+    }
+    refreshing = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (manualRefresh && view === 'list' && last) {
+      repaint();
+    }
+    try {
+      last = await compute();
+      manualRefresh = false;
+      repaint();
+    } catch (err) {
+      manualRefresh = false;
+      if (view === 'list') {
+        writeFrame(red(`Error: ${err.message}`));
+      }
+    }
+    refreshing = false;
+    timer = setTimeout(tick, interval);
+  };
+  const refreshNow = () => {
+    if (refreshing) {
+      return;
+    }
+    manualRefresh = true;
+    tick();
+  };
+
+  const loadDetails = (meta, key) => {
+    details.loading = true;
+    details.parts = null;
+    repaint();
+    fetchDetails(meta)
+      .then((parts) => {
+        detailsCache.set(key, parts);
+        if (view === 'details' && details.key === key) {
+          details.loading = false;
+          details.parts = parts;
+          repaint();
+        }
+      })
+      .catch((err) => {
+        if (view === 'details' && details.key === key) {
+          details.loading = false;
+          details.parts = { ci: { status: 'rejected' }, review: { status: 'rejected', reason: err } };
+          repaint();
+        }
+      });
+  };
+
+  const openDetails = () => {
+    const rowItem = lastItems.filter((it) => it.kind === 'row')[nav.sel];
+    if (!rowItem || !rowItem.meta) {
+      return;
+    }
+    const meta = rowItem.meta;
+    const key = `${meta.repo}#${meta.number}`;
+    view = 'details';
+    details.key = key;
+    details.meta = meta;
+    details.header = detailsHeader(meta);
+    details.scroll = 0;
+    if (detailsCache.has(key)) {
+      details.loading = false;
+      details.parts = detailsCache.get(key);
+      repaint();
+      return;
+    }
+    loadDetails(meta, key);
+  };
+
+  const handleDetailsKey = (key) => {
+    if (key === '\x1b') {
+      view = 'list';
+      repaint();
+      return;
+    }
+    if (key === 'r') {
+      detailsCache.delete(details.key);
+      loadDetails(details.meta, details.key);
+      return;
+    }
+    if (key === 'j' || key === '\x1b[B') {
+      details.scroll += 1;
+    } else if (key === 'k' || key === '\x1b[A') {
+      details.scroll -= 1;
+    } else if (key === '\x04') {
+      details.scroll += halfPage();
+    } else if (key === '\x15') {
+      details.scroll -= halfPage();
+    } else if (key === 'g') {
+      details.scroll = 0;
+    } else if (key === 'G') {
+      details.scroll = details.maxScroll;
+    } else {
+      return;
+    }
+    details.scroll = Math.max(0, Math.min(details.scroll, details.maxScroll));
+    repaint();
+  };
+
+  const matchTexts = () => lastItems.filter((it) => it.kind === 'row').map((it) => stripAnsi(it.text).toLowerCase());
+  const recomputeMatches = () => {
+    search.matches = computeSearchMatches(matchTexts(), search.query);
+  };
+
+  const handleListKey = (key) => {
+    if (search.active) {
+      if (key === '\x1b') {
+        search.active = false;
+        search.query = '';
+        search.matches = [];
+        nav.sel = search.origSel;
+      } else if (key === '\r' || key === '\n') {
+        search.active = false;
+      } else if (key === '\x7f' || key === '\x08') {
+        search.query = search.query.slice(0, -1);
+        recomputeMatches();
+        nav.sel = jumpToMatch(search.matches, nav.sel);
+      } else if (key.length === 1 && key >= ' ') {
+        search.query += key;
+        recomputeMatches();
+        nav.sel = jumpToMatch(search.matches, nav.sel);
+      } else {
+        return;
+      }
+      repaint();
+      return;
+    }
+    if (key === '/') {
+      search.active = true;
+      search.query = '';
+      search.matches = [];
+      search.origSel = nav.sel;
+      repaint();
+      return;
+    }
+    if (key === 'n' && search.matches.length) {
+      nav.sel = cycleMatch(search.matches, nav.sel, 1);
+      repaint();
+      return;
+    }
+    if (key === 'N' && search.matches.length) {
+      nav.sel = cycleMatch(search.matches, nav.sel, -1);
+      repaint();
+      return;
+    }
+    if (key === '\x1b' && search.matches.length) {
+      search.query = '';
+      search.matches = [];
+      repaint();
+      return;
+    }
+    if (key === 'r') {
+      refreshNow();
+      return;
+    }
+    if (key === 'm') {
+      showAll = !showAll;
+      nav.sel = 0;
+      repaint();
+      return;
+    }
+    if (key === '\r' || key === '\n') {
+      openDetails();
+      return;
+    }
+    const n = lastItems.reduce((c, it) => c + (it.kind === 'row' ? 1 : 0), 0);
+    if (n === 0) {
+      return;
+    }
+    if (key === 'j' || key === '\x1b[B') {
+      nav.sel = Math.min(n - 1, nav.sel + 1);
+    } else if (key === 'k' || key === '\x1b[A') {
+      nav.sel = Math.max(0, nav.sel - 1);
+    } else if (key === 'l' || key === '\x1b[C') {
+      nav.sel = jumpSection(lastItems, nav.sel, 1);
+    } else if (key === 'h' || key === '\x1b[D') {
+      nav.sel = jumpSection(lastItems, nav.sel, -1);
+    } else if (key === 'g') {
+      nav.sel = 0;
+    } else if (key === 'G') {
+      nav.sel = n - 1;
+    } else if (key === '\x04') {
+      nav.sel = Math.min(n - 1, nav.sel + halfPage());
+    } else if (key === '\x15') {
+      nav.sel = Math.max(0, nav.sel - halfPage());
+    } else {
+      return;
+    }
+    repaint();
+  };
+
+  if (interactive) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (key) => {
+      if (key === '\x03') {
+        restore();
+        process.exit(0);
+      }
+      if (view === 'list' && search.active) {
+        handleListKey(key);
+        return;
+      }
+      if (key === 'q') {
+        restore();
+        process.exit(0);
+      }
+      if (view === 'details') {
+        handleDetailsKey(key);
+      } else {
+        handleListKey(key);
+      }
+    });
+  }
+  process.stdout.on('resize', repaint);
+
+  paintScreen();
+  tick();
+} else {
+  compute()
+    .then((data) => {
+      console.log(flatten(render(data)));
+    })
+    .catch((err) => {
+      console.error(red(`Error: ${err.message}`));
+      process.exit(1);
+    });
+}

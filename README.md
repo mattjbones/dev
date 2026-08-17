@@ -30,12 +30,16 @@ actually changed.
 ## Layout
 
 - `bootstrap.sh` — orchestrator; sources `phases/*.sh` in order
-- `lib/common.sh` — shared helpers (logging, gates, backup-then-link)
+- `lib/common.sh` — shared bootstrap helpers (logging, gates, backup-then-link);
+  `lib/dash-tui.mjs` — shared ANSI/scrolling/nav engine for `linear-dash` and `github-dash`
 - `home/` — mirrors `$HOME`; every file here is symlinked into place by the dotfiles phase
 - `tests/` — plain-bash tests; run `bash tests/<name>_test.sh`
 - `agent-mux/` — tmux multi-worktree dev environment (`dev`, `dev ctl`,
   `dev sync` + cross-machine Claude chat resume) — see [its README](agent-mux/README.md)
-- `linear-dash`, `scripts/` — standalone tooling (`dev-aws.sh` AWS SSO creds, `seed-vault.sh`)
+- `linear-dash`, `github-dash`, `scripts/` — standalone tooling (`dev-aws.sh` AWS
+  SSO creds, `seed-vault.sh`); `github-dash` is a GitHub PR review-queue
+  dashboard, sibling to `linear-dash` — both share `lib/dash-tui.mjs`, their
+  ANSI/scrolling/nav engine
 
 ## Secrets (Tier 2)
 
