@@ -20,6 +20,8 @@
 set -u
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# shellcheck source=dev-close-cleanup.sh
+. "$SCRIPT_DIR/dev-close-cleanup.sh"
 INTERVAL="${DEV_TITLE_INTERVAL:-15}"
 
 LOCK_DIR="/tmp/dev-tmux-title"
@@ -155,6 +157,8 @@ EOF
   for cmd in "${cmds[@]}"; do
     eval "$cmd" >/dev/null 2>&1 || true
   done
+
+  dc_tick || true
 
   reflect_if_due
   sleep "$INTERVAL"
