@@ -14,19 +14,28 @@ set -euo pipefail
 # never sees concurrent writers and can't produce sync conflicts.
 #
 # Usage:
-#   ./dev-session-sync.sh record <session> <branch> <worktree> <model> [agent-session-id]
+#   ./dev-session-sync.sh record <session> <branch> <worktree> <model> [agent-session-id] [tickets]
 #       Upsert <session> as active in this host's manifest. Called by dev.sh
 #       on every invocation. Branch may be "" (main lupa checkout).
 #       agent-session-id is the Claude Code session uuid for the agent pane;
 #       when omitted (reattach) any previously recorded id is preserved.
+#       tickets is a comma-separated list of Linear ids (dev --ticket); they
+#       are unioned with ids parsed from the session name and branch, and
+#       with anything previously recorded, so a ticket is never dropped.
+#       Each entry also records transcriptPath: the local Claude chat jsonl
+#       for the agent pane (null for non-claude models).
 #
 #   ./dev-session-sync.sh reconcile
 #       Mark this host's manifest entries inactive when their tmux session no
 #       longer exists. Called by dev.sh on startup and by the tmux
 #       session-closed hook.
 #
-#   ./dev-session-sync.sh list
-#       Merged view of all hosts' manifests.
+#   ./dev-session-sync.sh list [--all] [--json] [--md]   (also: dev list)
+#       Merged view of all hosts' manifests: session, tickets, chat uuid,
+#       branch. Active sessions only unless --all. --json emits every entry
+#       (consumers filter). --md writes WORKTREES.md next to the manifests
+#       (an Obsidian-readable table, all hosts, all statuses) — manual-only,
+#       so the single-writer-per-file rule below is only bent on demand.
 #
 #   ./dev-session-sync.sh restore [--all | --here | <session>...]
 #       Recreate sessions recorded as active (and not already running here) via
@@ -77,7 +86,7 @@ machine_uuid() {
   ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
     | awk -F'"' '/IOPlatformUUID/{print $4; exit}'
 }
-HOST="$(machine_uuid)"; [ -n "$HOST" ] || HOST="$(hostname -s)"
+HOST="${DEV_SESSION_SYNC_HOST:-$(machine_uuid)}"; [ -n "$HOST" ] || HOST="$(hostname -s)"
 HOST_LABEL="$(scutil --get ComputerName 2>/dev/null || hostname -s)"
 MANIFEST="$ONEDRIVE_BASE/$HOST.json"
 TRANSCRIPTS_DIR="$ONEDRIVE_BASE/transcripts"
@@ -103,6 +112,31 @@ ensure_base() {
 # non-alphanumeric char of the cwd with '-'.
 munge_path() {
   printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'
+}
+
+# parse_linear_id lives in the board lib (side-effect free to source).
+# shellcheck source=dev-board-lib.sh
+source "$SCRIPT_DIR/dev-board-lib.sh"
+
+# jq: tickets for an entry — recorded .tickets, else parsed from session/branch
+# with the same TEAM-NNNN rule as parse_linear_id (rows written by other hosts
+# or before the field existed are never reconciled here).
+JQ_TIX='def tix: if has("tickets") then .tickets
+  else [.session, (.branch // "")] | map(select(. != "")
+        | capture("(^|[^A-Za-z0-9-])(?<team>[A-Za-z]{2,7})-(?<num>[0-9]{2,6})")?
+        | "\(.team | ascii_upcase)-\(.num)") | unique end;'
+
+# tickets_from <session> <branch> <comma-list> -> comma-joined normalised
+# unique Linear ids (ENG-123). Explicit ids go through parse_linear_id too so
+# `--ticket eng-123` lands as ENG-123.
+tickets_from() {
+  local session="$1" branch="$2" explicit="$3" tok t out=""
+  for tok in "$session" "$branch" ${explicit//,/ }; do
+    [ -n "$tok" ] || continue
+    t="$(parse_linear_id "$tok" || true)"
+    [ -n "$t" ] && out+="$t,"
+  done
+  printf '%s' "$out" | tr ',' '\n' | sed '/^$/d' | sort -u | paste -sd, -
 }
 
 # Copy local Claude transcripts for this host's recorded sessions to OneDrive
@@ -168,17 +202,26 @@ cmd_record() {
   local worktree="${3:-}"
   local model="${4:-claude}"
   local agent_session="${5:-}"
+  local tickets
+  tickets="$(tickets_from "$session" "$branch" "${6:-}")"
   ensure_base || return 0
   # agentSessionId: keep the previously recorded id when none is passed
   # (reattach upserts don't know it) so a resumable chat id is never lost.
+  # transcriptPath is derived from the *resolved* id inside jq for the same
+  # reason. tickets union with whatever was recorded before.
   update_manifest \
     --arg s "$session" --arg b "$branch" --arg w "$worktree" \
     --arg m "$model" --arg h "$HOST" --arg hl "$HOST_LABEL" --arg t "$(now_utc)" \
-    --arg a "$agent_session" \
-    '(map(select(.session == $s)) | (.[0].agentSessionId // "")) as $prev
+    --arg a "$agent_session" --arg tk "$tickets" \
+    --arg pd "$HOME/.claude/projects/$(munge_path "$worktree")" \
+    '(map(select(.session == $s)) | .[0]) as $old
+     | (($old.agentSessionId // "") | if $a != "" then $a else . end) as $id
+     | ((($old.tickets // []) + ($tk | split(",") | map(select(. != "")))) | unique) as $tix
      | [.[] | select(.session != $s)]
      + [{session: $s, branch: $b, worktree: $w, model: $m,
-         agentSessionId: (if $a != "" then $a else $prev end),
+         agentSessionId: $id,
+         transcriptPath: (if $id != "" then $pd + "/" + $id + ".jsonl" else null end),
+         tickets: $tix,
          status: "active", host: $h, hostLabel: $hl, updatedAt: $t}]'
   push_transcripts
 }
@@ -187,8 +230,13 @@ cmd_reconcile() {
   ensure_base || return 0
   local live
   live="$(tmux ls -F '#{session_name}' 2>/dev/null || true)"
+  # Also backfills .tickets on entries recorded before the field existed,
+  # using the same TEAM-NNNN rule as parse_linear_id, so `list` shows tickets
+  # for every worktree, not just ones re-opened since.
   update_manifest --arg live "$live" --arg t "$(now_utc)" \
-    '($live | split("\n") | map(select(. != ""))) as $l
+    "$JQ_TIX"'
+     ($live | split("\n") | map(select(. != ""))) as $l
+     | map(. + {tickets: tix})
      | map(if .status == "active" and ((.session as $s | $l | index($s)) == null)
            then . + {status: "inactive", updatedAt: $t}
            elif .status == "inactive" and ((.session as $s | $l | index($s)) != null)
@@ -199,16 +247,46 @@ cmd_reconcile() {
 
 cmd_list() {
   ensure_base || return 0
-  if [ "${1:-}" = "--json" ]; then
-    # Machine-readable merged view (all hosts). Consumers filter as needed.
-    cat "$ONEDRIVE_BASE"/*.json 2>/dev/null | jq -s 'add // [] | sort_by(.status, .session)'
+  local all=false json=false md=false
+  for a in "$@"; do
+    case "$a" in
+      --all)  all=true ;;
+      --json) json=true ;;
+      --md)   md=true ;;
+      *) echo "dev-session-sync list: unknown flag $a" >&2; return 1 ;;
+    esac
+  done
+  local merged
+  merged="$(cat "$ONEDRIVE_BASE"/*.json 2>/dev/null \
+    | jq -s "$JQ_TIX"'add // [] | map(. + {tickets: tix}) | sort_by(.status, .session)')"
+  if $json; then
+    # Machine-readable merged view (all hosts, all statuses). Consumers filter.
+    printf '%s\n' "$merged"
+    return
+  fi
+  if $md; then
+    local out="$ONEDRIVE_BASE/WORKTREES.md"
+    {
+      echo "# Dev worktrees"
+      echo
+      echo "Generated $(now_utc) by \`dev list --md\` on ${HOST_LABEL}. All hosts, all statuses."
+      echo
+      echo "| Session | Status | Host | Tickets | Branch | Worktree | Chat | Updated |"
+      echo "|---|---|---|---|---|---|---|---|"
+      printf '%s' "$merged" | jq -r '.[]
+        | "| \(.session) | \(.status) | \(.hostLabel // .host) | \((.tickets // []) | join(", ")) | \(.branch // "") | `\(.worktree // "")` | \(.agentSessionId // "") | \(.updatedAt) |"'
+    } > "$out"
+    echo "wrote $out"
     return
   fi
   {
-    echo "SESSION|HOST|STATUS|MODEL|UPDATED|BRANCH"
-    cat "$ONEDRIVE_BASE"/*.json 2>/dev/null | jq -r -s \
-      'add // [] | sort_by(.status, .session) | .[]
-       | [.session, (.hostLabel // .host), .status, .model, .updatedAt, (.branch // "")] | join("|")'
+    echo "SESSION|HOST|STATUS|MODEL|TICKETS|CHAT|UPDATED|BRANCH"
+    printf '%s' "$merged" | jq -r --argjson all "$all" \
+      '.[] | select($all or .status == "active")
+       | [.session, (.hostLabel // .host), .status, .model,
+          (((.tickets // []) | join(",")) | if . == "" then "-" else . end),
+          ((.agentSessionId // "") | if . == "" then "-" else . end),
+          .updatedAt, (.branch // "")] | join("|")'
   } | column -t -s '|'
 }
 
