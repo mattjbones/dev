@@ -116,19 +116,47 @@ source $ZSH/oh-my-zsh.sh
 # To customize prompt, run `p10k configure` or edit ~/.p10k.zsh.
 [[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh
 
-# nvm costs ~0.9s to source, dominating shell startup — lazy-load it instead:
-# the first call to any node tool loads the real nvm, then re-runs the command.
+# nvm is loaded from .zprofile for login shells. Retain lazy loading for
+# non-login shells, then select the nearest repository's .nvmrc on directory changes.
 export NVM_DIR="$HOME/.nvm"
 if [[ -s "$NVM_DIR/nvm.sh" ]]; then
   _load_nvm() {
-    unfunction nvm node npm npx corepack pnpm 2>/dev/null
-    source "$NVM_DIR/nvm.sh"
-    [[ -s "$NVM_DIR/bash_completion" ]] && source "$NVM_DIR/bash_completion"
+    if ! typeset -f nvm_find_nvmrc >/dev/null; then
+      unfunction nvm node npm npx corepack pnpm 2>/dev/null
+      source "$NVM_DIR/nvm.sh"
+      [[ -s "$NVM_DIR/bash_completion" ]] && source "$NVM_DIR/bash_completion"
+    fi
   }
-  for _t in nvm node npm npx corepack pnpm; do
-    eval "${_t}() { _load_nvm; ${_t} \"\$@\"; }"
-  done
-  unset _t
+
+  if ! typeset -f nvm >/dev/null; then
+    for _t in nvm node npm npx corepack pnpm; do
+      eval "${_t}() { _load_nvm; ${_t} \"\$@\"; }"
+    done
+    unset _t
+  fi
+
+  autoload -U add-zsh-hook
+  load-nvmrc() {
+    _load_nvm
+
+    local nvmrc_path
+    nvmrc_path="$(nvm_find_nvmrc)"
+
+    if [[ -n "$nvmrc_path" ]]; then
+      local nvmrc_node_version
+      nvmrc_node_version="$(nvm version "$(cat "$nvmrc_path")")"
+      if [[ "$nvmrc_node_version" == 'N/A' ]]; then
+        nvm install
+      elif [[ "$nvmrc_node_version" != "$(nvm version)" ]]; then
+        nvm use
+      fi
+    elif [[ -n "$(PWD=$OLDPWD nvm_find_nvmrc)" ]] && [[ "$(nvm version)" != "$(nvm version default)" ]]; then
+      nvm use default
+    fi
+  }
+
+  add-zsh-hook chpwd load-nvmrc
+  load-nvmrc
 fi
 
 
