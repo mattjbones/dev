@@ -1,5 +1,10 @@
 # Global preferences
 
+## Answering 
+
+Favour terse responses intially and only after asking for more details should you expand. 
+The chat should be light weight and quick question / answer and the designs should be refined and give clear outlines about what the problem being solved is.
+
 ## Superpowers doc locations
 
 The `superpowers:brainstorming` and `superpowers:writing-plans` skills note that user
