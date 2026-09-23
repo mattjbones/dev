@@ -122,9 +122,13 @@ session with its tickets, chat id and branch (`--all` for closed ones too,
 (`ENG-1234`) and can be added explicitly with `dev <branch> --ticket ENG-5678`
 (repeatable); re-running `dev` never drops a previously recorded ticket.
 
-**After a reboot.** The tmux server is in-memory, so macOS kills every dev
-session on shutdown; re-run `dev <name>` in each pane. A bare `dev <name>`
-reuses the model the session was last recorded with.
+**After a reboot / cmux restart.** The tmux server is in-memory, so macOS kills
+every dev session on shutdown. cmux replays each pane's saved resume command;
+`dev.sh` registers that command as `dev <name>` (via `dev-cmux-resume.sh`, using
+cmux's `surface resume set`), so the replay rebuilds the worktree session
+instead of running a doomed `tmux attach`. cmux records CLI-set bindings as
+manual-approval: the first replay asks you to approve the `dev …` command. A
+bare `dev <name>` reuses the model the session was last recorded with.
 
 Typical flow, Air → MBP:
 
@@ -164,6 +168,7 @@ never clobbered.
 | `dev.sh` | entry point: worktree + tmux session builder, `ctl`/`sync` dispatch |
 | `dev-ctl.sh` | fzf command centre for managing workspaces |
 | `dev-session-sync.sh` | OneDrive manifest + Claude transcript sync, restore picker |
+| `dev-cmux-resume.sh` | registers `dev <name>` as the pane's cmux resume command |
 | `dev-setup.sh` | one-time machine setup (DNS, docker network, traefik) |
 | `dev-tmux-agent-launch.sh` | launches the agent pane; resumes Claude by session uuid |
 | `dev-tmux-title.sh` | Ghostty tab title / status line updater (15s poll) |

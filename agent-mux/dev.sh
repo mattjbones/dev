@@ -323,7 +323,7 @@ sync_session_state() {
 }
 
 # No --model given: reuse the model this session was last recorded with, so a
-# bare `dev <name>` (e.g. after a reboot) rebuilds it faithfully.
+# bare `dev <name>` (what cmux replays after a reboot) rebuilds it faithfully.
 if [ -z "$MODEL_EXPLICIT" ] && [ -x "$SESSION_SYNC_SCRIPT" ]; then
   recorded_entry="$("$SESSION_SYNC_SCRIPT" __entry "$SESSION" 2>/dev/null || true)"
   case "$recorded_entry" in
@@ -332,6 +332,15 @@ if [ -z "$MODEL_EXPLICIT" ] && [ -x "$SESSION_SYNC_SCRIPT" ]; then
   esac
   unset recorded_entry recorded_model
 fi
+
+# Tell cmux to replay `dev <name>` for this pane instead of the raw
+# `tmux attach` it would otherwise detect (dies after reboot). Best-effort.
+set_cmux_resume_binding() {
+  [ -x "$SCRIPT_DIR/dev-cmux-resume.sh" ] || return 0
+  local extra=()
+  [ -n "$MODEL_EXPLICIT" ] && extra=(--model "$MODEL")
+  "$SCRIPT_DIR/dev-cmux-resume.sh" "$SESSION" ${extra[@]+"${extra[@]}"} 2>/dev/null || true
+}
 
 # Attach to $SESSION. From inside another tmux session (e.g. `dev X` typed in a
 # dev shell pane) attach-session refuses to nest, so switch the client instead.
@@ -359,6 +368,7 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
     echo "Session '$SESSION' already running (no-attach mode)"
     exit 0
   fi
+  set_cmux_resume_binding
   attach_session
 fi
 
@@ -494,5 +504,6 @@ tmux select-pane -t "$SESSION:.0"
 if [ "${DEV_TMUX_NO_ATTACH:-}" = "1" ]; then
   echo "Session '$SESSION' created (no-attach mode)"
 else
+  set_cmux_resume_binding
   attach_session
 fi
