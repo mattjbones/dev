@@ -93,7 +93,7 @@ usage() {
   local me
   me="$(basename "$0")"
   cat <<EOF
-Usage: $me [options] [branch-name]
+Usage: $me [options] [branch-name] [--ticket ID ...]
 
 Create or reuse a git worktree for <branch> (from $LUPA_REPO): prefers git's
 registered path, then ~/workspace/<branch>, then $LUPA_REPO/.claude/worktrees/<branch>.
@@ -101,10 +101,14 @@ Otherwise adds a new worktree under ~/workspace/<branch>. Opens tmux: agent,
 build (optional Docker), and shell. With no branch name, uses the main lupa checkout.
 
 Options:
-  --model claude|codex   Agent in the first pane (default: claude)
+  --model claude|codex   Agent in the first pane (default: the model this session
+                         was last opened with, else codex)
   --docker               Run ./docker/docker-start.sh in the build pane (default: off)
   --no-docker            Do not run ./docker/docker-start.sh in the build pane (default)
   --services LIST        Accepted; not passed to docker-start (worktree name only)
+  --ticket ID            Linear ticket(s) for this worktree (repeatable, or
+                         comma-separated). Recorded in the OneDrive manifest
+                         alongside ids parsed from the branch/session name.
   -h, --help             Show this help
 
 Environment:
@@ -121,6 +125,11 @@ Commands:
   sync                    Pick sessions active on another machine (fzf: TAB some,
                           ctrl-a all) and restore them here, resuming each
                           session's Claude chat from its synced transcript.
+  list [--all|--json|--md]
+                          Worktree registry: every dev session with its tickets,
+                          Claude chat id and branch. Active only by default;
+                          --all includes closed ones; --md writes WORKTREES.md
+                          to OneDrive (Obsidian-readable).
 
 In tmux: Ctrl-a W opens the dev-ctl command centre ($SCRIPT_DIR/dev-ctl.sh).
 
@@ -165,9 +174,11 @@ propagate_cmux_env() {
   done
 }
 
-MODEL="claude"
+MODEL="codex"
+MODEL_EXPLICIT=""
 USE_DOCKER=false
 SERVICES="server"
+TICKETS=""
 
 # Parse flags
 while [[ "${1:-}" == -* ]]; do
@@ -177,7 +188,8 @@ while [[ "${1:-}" == -* ]]; do
       exit 0
       ;;
     --model)
-      MODEL="${2:-claude}"
+      MODEL="${2:-codex}"
+      MODEL_EXPLICIT=1
       shift 2
       ;;
     --docker)
@@ -190,6 +202,10 @@ while [[ "${1:-}" == -* ]]; do
       ;;
     --services)
       SERVICES="${2:-server,work}"
+      shift 2
+      ;;
+    --ticket)
+      TICKETS="${TICKETS:+$TICKETS,}${2:?--ticket needs an id}"
       shift 2
       ;;
     *)
@@ -208,6 +224,10 @@ case "${1:-}" in
     shift
     exec "$SCRIPT_DIR/dev-session-sync.sh" sync "$@"
     ;;
+  list)
+    shift
+    exec "$SCRIPT_DIR/dev-session-sync.sh" list "$@"
+    ;;
   board)
     shift
     exec "$SCRIPT_DIR/dev-board.sh" "$@"
@@ -225,6 +245,21 @@ if [ -f "$LUPA_REPO/.git/shallow" ]; then
 fi
 
 BRANCH="${1:-}"
+[ $# -gt 0 ] && shift
+
+# Flags may also trail the branch name (`dev my-branch --ticket ENG-123`).
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ticket)
+      TICKETS="${TICKETS:+$TICKETS,}${2:?--ticket needs an id}"
+      shift 2
+      ;;
+    *)
+      echo "Unknown trailing argument: $1 (try --help)"
+      exit 1
+      ;;
+  esac
+done
 
 if [ -n "$BRANCH" ]; then
   WORKTREE="$HOME/workspace/$BRANCH"
@@ -283,7 +318,28 @@ sync_session_state() {
   if [ -x "$SESSION_SYNC_SCRIPT" ]; then
     "$SESSION_SYNC_SCRIPT" reconcile 2>/dev/null || true
     "$SESSION_SYNC_SCRIPT" record "$SESSION" "$BRANCH" "$WORKTREE" "$MODEL" \
-      "${CLAUDE_SESSION_ID:-}" 2>/dev/null || true
+      "${CLAUDE_SESSION_ID:-}" "$TICKETS" 2>/dev/null || true
+  fi
+}
+
+# No --model given: reuse the model this session was last recorded with, so a
+# bare `dev <name>` (e.g. after a reboot) rebuilds it faithfully.
+if [ -z "$MODEL_EXPLICIT" ] && [ -x "$SESSION_SYNC_SCRIPT" ]; then
+  recorded_entry="$("$SESSION_SYNC_SCRIPT" __entry "$SESSION" 2>/dev/null || true)"
+  case "$recorded_entry" in
+    \{*) recorded_model="$(printf '%s' "$recorded_entry" | jq -r '.model // ""' 2>/dev/null || true)"
+         case "$recorded_model" in claude|codex) MODEL="$recorded_model" ;; esac ;;
+  esac
+  unset recorded_entry recorded_model
+fi
+
+# Attach to $SESSION. From inside another tmux session (e.g. `dev X` typed in a
+# dev shell pane) attach-session refuses to nest, so switch the client instead.
+attach_session() {
+  if [ -n "${TMUX:-}" ]; then
+    exec tmux switch-client -t "$SESSION"
+  else
+    exec tmux attach-session -t "$SESSION"
   fi
 }
 
@@ -299,7 +355,11 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
   # Ensure the shared title daemon is up (no-op if already running) - the setup
   # block below that normally launches it is skipped on the reattach path.
   nohup "$SCRIPT_DIR/dev-tmux-titled.sh" >/dev/null 2>&1 &
-  exec tmux attach-session -t "$SESSION"
+  if [ "${DEV_TMUX_NO_ATTACH:-}" = "1" ]; then
+    echo "Session '$SESSION' already running (no-attach mode)"
+    exit 0
+  fi
+  attach_session
 fi
 
 ensure_monorepo_deps "$WORKTREE"
@@ -434,5 +494,5 @@ tmux select-pane -t "$SESSION:.0"
 if [ "${DEV_TMUX_NO_ATTACH:-}" = "1" ]; then
   echo "Session '$SESSION' created (no-attach mode)"
 else
-  tmux attach-session -t "$SESSION"
+  attach_session
 fi

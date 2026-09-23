@@ -111,9 +111,20 @@ Quick actions live in `~/.config/dev-ctl/quick-actions.txt`.
 
 Session state syncs through OneDrive
 (`docs/scripts/dev-sessions/`): each host writes its own manifest
-(`<hostname>.json` — session, branch, model, Claude session id, active/inactive),
-and Claude chat transcripts are copied to `transcripts/<uuid>.jsonl`. The tmux
-layout itself is never synced — `dev <branch>` rebuilds it deterministically.
+(`<hostname>.json` — session, branch, worktree, model, Linear tickets, Claude
+session id + local transcript path, active/inactive), and Claude chat
+transcripts are copied to `transcripts/<uuid>.jsonl`. The tmux layout itself is
+never synced — `dev <branch>` rebuilds it deterministically.
+
+The manifest doubles as a **worktree registry**: `dev list` shows every active
+session with its tickets, chat id and branch (`--all` for closed ones too,
+`--md` for an Obsidian table). Tickets are parsed from the session/branch name
+(`ENG-1234`) and can be added explicitly with `dev <branch> --ticket ENG-5678`
+(repeatable); re-running `dev` never drops a previously recorded ticket.
+
+**After a reboot.** The tmux server is in-memory, so macOS kills every dev
+session on shutdown; re-run `dev <name>` in each pane. A bare `dev <name>`
+reuses the model the session was last recorded with.
 
 Typical flow, Air → MBP:
 
@@ -141,7 +152,7 @@ never clobbered.
 | Command | What it does |
 | --- | --- |
 | `sync` | interactive restore picker (`dev sync`) |
-| `list` | merged view of all hosts' sessions |
+| `list [--all\|--json\|--md]` | worktree registry (`dev list`): session, tickets, Claude chat id, branch. Active only unless `--all`; `--md` writes `WORKTREES.md` to OneDrive for Obsidian |
 | `restore [--all\|<session>...]` | non-interactive restore |
 | `push` | snapshot local transcripts to OneDrive now |
 | `record` / `reconcile` | manifest upkeep — called by dev.sh, not by hand |
