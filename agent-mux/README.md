@@ -124,7 +124,10 @@ session with its tickets, chat id and branch (`--all` for closed ones too,
 
 **After a reboot.** The tmux server is in-memory, so macOS kills every dev
 session on shutdown; re-run `dev <name>` in each pane. A bare `dev <name>`
-reuses the model the session was last recorded with.
+reuses the model the session was last recorded with and resumes the worktree's
+last agent chat: Claude by its recorded chat id (else `--continue`), Codex by
+the newest chat for the worktree in codex's thread index. `--fresh` starts a
+new chat instead.
 
 Typical flow, Air → MBP:
 
