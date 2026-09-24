@@ -106,6 +106,8 @@ Options:
   --docker               Run ./docker/docker-start.sh in the build pane (default: off)
   --no-docker            Do not run ./docker/docker-start.sh in the build pane (default)
   --services LIST        Accepted; not passed to docker-start (worktree name only)
+  --fresh                Start a new agent chat instead of resuming this
+                         worktree's last one
   --ticket ID            Linear ticket(s) for this worktree (repeatable, or
                          comma-separated). Recorded in the OneDrive manifest
                          alongside ids parsed from the branch/session name.
@@ -179,6 +181,7 @@ MODEL_EXPLICIT=""
 USE_DOCKER=false
 SERVICES="server"
 TICKETS=""
+FRESH=""
 
 # Parse flags
 while [[ "${1:-}" == -* ]]; do
@@ -207,6 +210,10 @@ while [[ "${1:-}" == -* ]]; do
     --ticket)
       TICKETS="${TICKETS:+$TICKETS,}${2:?--ticket needs an id}"
       shift 2
+      ;;
+    --fresh)
+      FRESH=1
+      shift
       ;;
     *)
       echo "Unknown option: $1 (try --help)"
@@ -253,6 +260,10 @@ while [ $# -gt 0 ]; do
     --ticket)
       TICKETS="${TICKETS:+$TICKETS,}${2:?--ticket needs an id}"
       shift 2
+      ;;
+    --fresh)
+      FRESH=1
+      shift
       ;;
     *)
       echo "Unknown trailing argument: $1 (try --help)"
@@ -322,13 +333,20 @@ sync_session_state() {
   fi
 }
 
-# No --model given: reuse the model this session was last recorded with, so a
-# bare `dev <name>` (e.g. after a reboot) rebuilds it faithfully.
-if [ -z "$MODEL_EXPLICIT" ] && [ -x "$SESSION_SYNC_SCRIPT" ]; then
+# A bare `dev <name>` (e.g. after a reboot) rebuilds the session faithfully:
+# no --model given → reuse the recorded model; and unless --fresh, reuse the
+# recorded Claude chat id so the agent pane resumes that chat.
+RECORDED_CLAUDE_ID=""
+if [ -x "$SESSION_SYNC_SCRIPT" ]; then
   recorded_entry="$("$SESSION_SYNC_SCRIPT" __entry "$SESSION" 2>/dev/null || true)"
   case "$recorded_entry" in
     \{*) recorded_model="$(printf '%s' "$recorded_entry" | jq -r '.model // ""' 2>/dev/null || true)"
-         case "$recorded_model" in claude|codex) MODEL="$recorded_model" ;; esac ;;
+         if [ -z "$MODEL_EXPLICIT" ]; then
+           case "$recorded_model" in claude|codex) MODEL="$recorded_model" ;; esac
+         fi
+         if [ -z "$FRESH" ] && [ "$recorded_model" = "claude" ]; then
+           RECORDED_CLAUDE_ID="$(printf '%s' "$recorded_entry" | jq -r '.agentSessionId // ""' 2>/dev/null || true)"
+         fi ;;
   esac
   unset recorded_entry recorded_model
 fi
@@ -370,7 +388,7 @@ ensure_monorepo_deps "$WORKTREE"
 # the id exists, otherwise starts fresh under this id.
 CLAUDE_SESSION_ID=""
 if [ "$MODEL" = "claude" ]; then
-  CLAUDE_SESSION_ID="${DEV_CLAUDE_SESSION_ID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}"
+  CLAUDE_SESSION_ID="${DEV_CLAUDE_SESSION_ID:-${RECORDED_CLAUDE_ID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}}"
   # Restoring a session synced from another machine: pull its Claude transcript
   # into the project dir for THIS machine's worktree path. Usernames differ
   # across machines, so ~/workspace/<branch> is a different absolute path (and
@@ -418,7 +436,7 @@ case "$MODEL" in
     ;;
 esac
 
-AGENT_CMD="$AGENT_LAUNCH_SCRIPT $MODEL${CLAUDE_SESSION_ID:+ $CLAUDE_SESSION_ID}"
+AGENT_CMD="${FRESH:+DEV_AGENT_FRESH=1 }$AGENT_LAUNCH_SCRIPT $MODEL${CLAUDE_SESSION_ID:+ $CLAUDE_SESSION_ID}"
 
 tmux select-pane -t "$SESSION:.0" -T "$AGENT_ICON $AGENT_LABEL"
 send_keys_when_ready "$SESSION:.0" "$AGENT_CMD"
